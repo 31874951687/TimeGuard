@@ -29,7 +29,7 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: 单元测试（22 时长 + 32 待办 + 48 周期规则 + 49 调度器 + 21 累计打卡）
+      - name: 单元测试（全部套件：时长 / 待办 / 周期规则 / 调度器 / 累计打卡）
         env:
           # 让测试用临时目录，别碰真实数据；顺便验证这一条也生效
           TIMEGUARD_NO_TOAST: '1'
