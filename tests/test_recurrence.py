@@ -533,6 +533,18 @@ def test_task_stats_do_not_backfill_before_creation() -> None:
     store.close()
 
 
+def _passed_window_end(now: datetime) -> str | None:
+    """构造一个"今天已经结束"的时间窗结束时刻（``HH:MM``）；构造不出时返回 ``None``。
+
+    用"当前这一分钟"最稳：``combine(今天, HH:MM) <= now`` 恒成立，而且一定还在今天
+    —— 不能用 ``now - 1 分钟``，那样在 00:00:xx 会退到昨天，用例就会因为跨零点而挂。
+    只有 00:00 这一分钟真的构造不出来（结束时刻不能早于开始时刻 00:00）。
+    """
+    if now.hour == 0 and now.minute == 0:
+        return None
+    return now.strftime("%H:%M")
+
+
 def test_new_task_with_passed_window_is_not_overdue_today() -> None:
     """新建的周期任务如果今天的时间窗已经过去，**今天不算逾期**，从明天开始。
 
@@ -542,10 +554,13 @@ def test_new_task_with_passed_window_is_not_overdue_today() -> None:
     """
     store = _store()
     now = datetime.now()
-    end = now - timedelta(minutes=1)                     # 已经过去的窗口
-    assert end.date() == now.date(), "这条用例只在同一天内跑得通（凌晨请重跑）"
+    end = _passed_window_end(now)                        # 已经过去的窗口
+    if end is None:
+        print("  [跳过] 正好 00:00，构造不出『今天已过去』的时间窗")
+        store.close()
+        return
     task_id = store.add_task("晚上才建的每日跑步", task_type=R.TYPE_DAILY,
-                             time_start="00:00", time_end=end.strftime("%H:%M"))
+                             time_start="00:00", time_end=end)
     task = store.get_task(task_id)
     assert task is not None
     assert task.rule.start_date == now.date() + timedelta(days=1)
@@ -568,20 +583,23 @@ def test_editing_window_to_passed_time_pushes_start_date() -> None:
     """把已有任务的时间段改成"今天已经过去"的，同样从明天开始（但已打卡的不动）。"""
     store = _store()
     now = datetime.now()
-    end = now - timedelta(minutes=1)
-    assert end.date() == now.date(), "这条用例只在同一天内跑得通（凌晨请重跑）"
+    end = _passed_window_end(now)
+    if end is None:
+        print("  [跳过] 正好 00:00，构造不出『今天已过去』的时间窗")
+        store.close()
+        return
     task_id = store.add_task("每日跑步", task_type=R.TYPE_DAILY,
                              time_start="00:00", time_end="23:59", start_date="")
     assert store.get_task(task_id).rule.start_date is None
 
-    assert store.update_task(task_id, time_start="00:00", time_end=end.strftime("%H:%M")) is True
+    assert store.update_task(task_id, time_start="00:00", time_end=end) is True
     assert store.get_task(task_id).rule.start_date == now.date() + timedelta(days=1)
 
     # 已经打过卡的今天不能被抹掉：先打卡，再把时间段改成已过去的 → 不推生效日
     other = store.add_task("每日阅读", task_type=R.TYPE_DAILY,
                            time_start="00:00", time_end="23:59", start_date="")
     assert store.complete_occurrence(other, now.date(), completed=True) is True
-    assert store.update_task(other, time_start="00:00", time_end=end.strftime("%H:%M")) is True
+    assert store.update_task(other, time_start="00:00", time_end=end) is True
     assert store.get_task(other).rule.start_date is None
     assert store.is_occurrence_done(other, now.date()) is True
     store.close()
@@ -781,8 +799,17 @@ def test_rule_start_date_blocks_earlier_days() -> None:
     assert rule.occurrences_between(datetime(2026, 10, 7, 0, 0),
                                     datetime(2026, 10, 9, 23, 59)) == [
         R.Occurrence(date(2026, 10, 9), datetime(2026, 10, 9, 6, 0), datetime(2026, 10, 9, 8, 0))]
-    # 文案里写明从哪天开始，免得看着像"已经生效但没做"
-    assert "10-09 开始" in rule.schedule_text(), rule.schedule_text()
+    # 文案里写明从哪天开始，免得看着像"已经生效但没做"。
+    # 注意：schedule_text() 要和**真实的今天**比，所以这里不能用上面那个固定日期
+    # —— 用例写死 2026-10-09 时，一旦真的到了 10-09（跨零点）就会挂，
+    # CI 上就是这么红过一次。改用相对今天的动态日期。
+    tomorrow = date.today() + timedelta(days=1)
+    future = R.TaskRule.daily("06:00", "08:00", start_date=tomorrow)
+    assert "开始）" in future.schedule_text(), future.schedule_text()
+    assert f"{tomorrow:%m-%d} 开始" in future.schedule_text(), future.schedule_text()
+    # 生效日就是今天（或过去）→ 不该有多余说明
+    today_rule = R.TaskRule.daily("06:00", "08:00", start_date=date.today())
+    assert "开始）" not in today_rule.schedule_text(), today_rule.schedule_text()
 
 
 def test_rule_from_row_handles_start_date_and_legacy_null() -> None:
