@@ -1,5 +1,9 @@
 # TimeGuard 时间管家 ⏳
 
+[![tests](https://github.com/31874951687/TimeGuard/actions/workflows/tests.yml/badge.svg)](https://github.com/31874951687/TimeGuard/actions/workflows/tests.yml)
+![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)
+![python](https://img.shields.io/badge/python-3.11%20%7C%203.13%20%7C%203.14-3776ab)
+
 > 常驻 Windows 后台的**游戏 / 网页使用时长监控 + 待办任务管理**工具：达到每日上限后用右下角通知 + 置顶弹窗强制提醒你休息，开机时用鼓励语提醒你今天要做的事，并用 7 天柱状图让你看见时间去了哪里。
 
 专为"无意识刷视频 / 打游戏"场景设计：只在被监控的程序处于**前台活跃**时计时，切走、最小化、锁屏、休眠都会自动暂停。
@@ -849,7 +853,6 @@ Setting("game_processes", "监控的游戏 / 软件进程名", "监控对象", "
 **设置页已不再使用它** —— 那里的内容太多，必须走表格自绘。
 
 ### 相似的开源项目（调研结论）
-
 写这个项目之前调研了一圈同类工具，完整对比表（星数 / 语言 / 最后更新 / 许可证，数据直接查 GitHub API）
 放在 [docs/RELATED.md](docs/RELATED.md)。一句话结论：
 
@@ -885,3 +888,4 @@ Setting("game_processes", "监控的游戏 / 软件进程名", "监控对象", "
 | 设置页就地编辑（v1.4） | `tools/e2e_settings_inline.py`：21 项断言全通过 —— 整数不再显示成 `120.0`、编辑区保留单位「分钟」、浮层覆盖整个「当前值」单元格（数字与单位同一触发区）、点单位那侧也能进编辑、点「说明」列不弹框、非法输入被拒、超界被夹取、布尔项是「开启 / 关闭」下拉、空格快速翻转仍可用 |
 | 开机提醒弹窗（v1.4） | `tools/e2e_startup_dialog.py`：17 项断言全通过 —— 大号 ✕（52×44px）能立刻关闭、倒计时从 5 秒递减、归零后自动关闭、同一天第二次启动不弹、换一天又能弹、托盘提示只发一次并写明"以后不再自动提示" |
 | 周期任务生效起始日（v1.4） | `tools/e2e_start_date.py`：14 项断言全通过（真实对话框建任务）—— 21 点建「每天 20:33~21:33」→ 生效日是明天、今天不排班、列表落「本周待办」且不是"已超期"、今日统计与 7 天图表都不记逾期、调度器下一次唤醒在明天；建「每天 21:48~22:48」（还没到）→ 生效日就是今天、正常进「今日待办」 |
+| GitHub Actions CI | 推上 GitHub 后自动跑（Python 3.11 + 3.13）：140 个单元测试 + `--selftest` + ruff 全部通过。**CI 上线第一天就抓出两个真问题**：① 用例里写死了 `2026-10-09`，到了这天"生效日晚于今天"不再成立，断言挂掉；② runner 是 en-US，stdout 走管道时用 cp1252 编码，脚本最后那行中文摘要抛 `UnicodeEncodeError` —— 测试全过但退出码 1。后者不只是 CI 问题：**任何英文系统的用户跑 `--selftest` 都会崩**。修法是新增 `utils.use_utf8_console()`（把 stdout/stderr 切到 UTF-8，`errors="replace"`），`main()` 与 4 个测试入口都调用 |
