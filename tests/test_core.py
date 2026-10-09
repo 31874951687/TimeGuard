@@ -22,6 +22,7 @@ os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_test_")
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from timeguard import winapi  # noqa: E402
+from timeguard.utils import use_utf8_console  # noqa: E402
 from timeguard.config import Config  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
 from timeguard.engine import UsageEngine  # noqa: E402
@@ -470,6 +471,7 @@ def test_popup_queue_pump_and_defer() -> None:
 # ---------------------------------------------------------------- 简易执行器
 def _main() -> int:
     """无 pytest 时的极简测试执行器（每个用例独立空目录）。"""
+    use_utf8_console()          # 英文系统下打印中文不再抛 UnicodeEncodeError
     import traceback
 
     tests = [

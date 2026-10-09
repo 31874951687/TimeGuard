@@ -20,6 +20,7 @@ os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_task_test_
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from timeguard import autostart, phrases  # noqa: E402
+from timeguard.utils import use_utf8_console  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
 from timeguard.datepicker import quick_datetime  # noqa: E402
 from timeguard.tasks import build_reminder_text  # noqa: E402
@@ -748,6 +749,7 @@ def test_time_monitor_tables_survive_upgrade() -> None:
 # ---------------------------------------------------------------- 简易执行器
 def _main() -> int:
     """无 pytest 时的极简执行器。"""
+    use_utf8_console()          # 英文系统下打印中文不再抛 UnicodeEncodeError
     import traceback
 
     tests = [

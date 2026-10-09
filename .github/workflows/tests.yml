@@ -33,6 +33,9 @@ jobs:
         env:
           # 让测试用临时目录，别碰真实数据；顺便验证这一条也生效
           TIMEGUARD_NO_TOAST: '1'
+          # runner 是 en-US：stdout 走管道时默认 cp1252，中文输出会抛 UnicodeEncodeError
+          # （第一次跑 CI 就是这么红的）。测试脚本自己也会调 use_utf8_console()，这里再加一道保险。
+          PYTHONIOENCODING: utf-8
         run: |
           python tests/test_core.py
           python tests/test_tasks.py
@@ -42,9 +45,12 @@ jobs:
       - name: 环境自检
         env:
           TIMEGUARD_NO_TOAST: '1'
+          PYTHONIOENCODING: utf-8
         run: python -m timeguard --selftest
 
       - name: 代码风格（pyflakes 级别：未定义名 / 未用导入）
+        env:
+          PYTHONIOENCODING: utf-8
         run: |
           pip install ruff
           ruff check --select F,E9 timeguard tests tools

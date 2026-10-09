@@ -18,7 +18,7 @@ import tkinter as tk
 from datetime import datetime, timedelta
 from tkinter import messagebox
 
-from . import __version__, autostart, paths, winapi
+from . import __version__, autostart, paths, utils, winapi
 from .config import Config
 from .database import UsageStore
 from .engine import UsageEngine
@@ -241,6 +241,7 @@ def selftest() -> int:
 
 def main(argv: list[str] | None = None) -> int:
     """程序主入口。"""
+    utils.use_utf8_console()      # 英文系统（cp1252）下打印中文不再抛 UnicodeEncodeError
     parser = argparse.ArgumentParser(description="TimeGuard —— 游戏 / 网页使用时长监控与提醒")
     parser.add_argument("--selftest", action="store_true", help="只运行环境自检，不打开界面")
     parser.add_argument("--verbose", "-v", action="store_true", help="输出调试日志")

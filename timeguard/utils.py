@@ -4,11 +4,34 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import tempfile
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
+
+
+# ---------------------------------------------------------------- 控制台编码
+def use_utf8_console() -> None:
+    """把标准输出/错误切到 UTF-8，避免中文在非中文 Windows 上把程序打崩。
+
+    真实踩坑：GitHub Actions 的 Windows runner 是 en-US，stdout 走管道时
+    Python 用 cp1252 编码，`print("通过 140 个…")` 直接抛 UnicodeEncodeError，
+    于是**测试全过、退出码却是 1**（CI 红过一次）。
+    普通用户把系统换成英文后跑 `--selftest` 也会遇到同样的事。
+
+    ``errors="replace"`` 保证即使终端真的显示不了中文，也只是变成问号，不会中断程序。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            pass                       # 某些重定向场景不允许重配置，忽略即可
+
 
 # ---------------------------------------------------------------- 时间相关
 

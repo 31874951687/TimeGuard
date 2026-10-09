@@ -19,6 +19,7 @@ os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_sched_test
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from timeguard import recurrence as R  # noqa: E402
+from timeguard.utils import use_utf8_console  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
 from timeguard.scheduler import (  # noqa: E402
     KIND_ADVANCE,
@@ -669,6 +670,7 @@ def test_reschedule_after_toggle_back_on() -> None:
 
 # ================================================================ 简易执行器
 def _main() -> int:
+    use_utf8_console()          # 英文系统下打印中文不再抛 UnicodeEncodeError
     import traceback
 
     tests = [

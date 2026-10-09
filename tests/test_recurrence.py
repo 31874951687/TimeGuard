@@ -23,6 +23,7 @@ os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_recur_test
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from timeguard import recurrence as R  # noqa: E402
+from timeguard.utils import use_utf8_console  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
 
 
@@ -834,6 +835,7 @@ def test_rule_from_row_handles_start_date_and_legacy_null() -> None:
 # ================================================================ 简易执行器
 def _main() -> int:
     """无 pytest 时的极简执行器。"""
+    use_utf8_console()          # 英文系统下打印中文不再抛 UnicodeEncodeError
     import traceback
 
     tests = [
