@@ -58,6 +58,11 @@ DEFAULT_TARGET_COUNT = 30
 MAX_TARGET_COUNT = 9999
 DEFAULT_REMIND_TIME = "18:00"
 
+#: "监控时长达标就自动打卡"（可选功能）的默认与取值范围（分钟）
+DEFAULT_AUTO_MINUTES = 30
+MIN_AUTO_MINUTES = 1
+MAX_AUTO_MINUTES = 24 * 60
+
 #: 星期中文名（ISO：1=周一）
 WEEKDAY_CN = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
 
@@ -280,6 +285,37 @@ def cumulative_status(rule: TaskRule, checkin_dates, today: date | None = None) 
                             today_checked=today in days, reached_on=reached_on)
 
 
+def auto_checkin_ready(rule: TaskRule, seconds_today: float, *,
+                       checked_today: bool = False, today: date | None = None) -> tuple[bool, str]:
+    """判断"监控时长够了，该自动打卡了"（纯函数，方便单测）。
+
+    必须**全部**满足才自动打卡：
+
+    1. 这条任务开了自动打卡（配了 ``auto_target`` 与阈值）；
+    2. 今天还没打过卡 —— 同一天只能打一次卡，自动打卡也不能例外；
+    3. 任务还没达标、也没过期（与手动提醒同一套口径，用的还是
+       :func:`cumulative_status` 的状态机）；
+    4. 今天的监控时长已经达到阈值。
+
+    返回 ``(是否可以打卡, 说明)``；说明直接给界面/备注用。
+    """
+    if not rule.auto_enabled:
+        return False, "这条任务没有开启「监控时长达标自动打卡」"
+    today = today or date.today()
+    if rule.is_expired(today):
+        return False, f"已过截止日期（{rule.deadline:%Y-%m-%d}），不再自动打卡"
+    threshold = (rule.auto_minutes or DEFAULT_AUTO_MINUTES) * 60
+    minutes = max(0.0, float(seconds_today or 0.0)) / 60
+    if checked_today:
+        return False, "今天已经打过卡了（同一天只算一次）"
+    if seconds_today < threshold:
+        need = (threshold - max(0.0, float(seconds_today or 0.0))) / 60
+        return False, (f"{rule.auto_target} 今日已用 {minutes:.0f} 分钟，"
+                       f"还差 {max(1, int(need + 0.999))} 分钟自动打卡")
+    return True, (f"{rule.auto_target} 今日已用 {minutes:.0f} 分钟"
+                  f"（≥ {threshold // 60} 分钟），自动打卡")
+
+
 def weekdays_text(days) -> str:
     """``(1,3,5)`` → ``"周一、周三、周五"``；每天/无则给相应文案。"""
     parsed = parse_iso_weekdays(format_iso_weekdays(days))
@@ -357,6 +393,10 @@ class TaskRule:
     deadline: date | None = None
     #: 每日提醒时间（一个时间点，不是时间窗）
     remind_time: time | None = None
+    #: 【可选】监控对象名（如"高数"）：今日累计时长达到 auto_minutes 就自动打卡
+    auto_target: str | None = None
+    #: 【可选】自动打卡的时长阈值（分钟）
+    auto_minutes: int | None = None
 
     def __post_init__(self) -> None:
         """归一化：结束时间不得早于/等于开始时间（否则当天那次会被跳过）。
@@ -399,6 +439,11 @@ class TaskRule:
             target = int(get("target_count"))
         except (TypeError, ValueError):
             target = None
+        try:
+            auto_minutes = int(get("auto_minutes"))
+        except (TypeError, ValueError):
+            auto_minutes = None
+        auto_target = (get("auto_target") or "").strip() or None
         return cls(
             task_type=task_type,
             time_start=start,
@@ -410,17 +455,25 @@ class TaskRule:
             deadline=_parse_date(get("deadline")),
             remind_time=(parse_hhmm(get("remind_time"), DEFAULT_REMIND_TIME)
                          if get("remind_time") else None),
+            auto_target=auto_target,
+            auto_minutes=(None if auto_target is None else
+                          max(MIN_AUTO_MINUTES, min(MAX_AUTO_MINUTES,
+                                                    auto_minutes or DEFAULT_AUTO_MINUTES))),
         )
 
     @classmethod
     def cumulative(cls, target_count: int, deadline: date | str | None,
-                   remind_time: str = DEFAULT_REMIND_TIME) -> "TaskRule":
+                   remind_time: str = DEFAULT_REMIND_TIME,
+                   auto_target: str | None = None,
+                   auto_minutes: int | None = None) -> "TaskRule":
         """构造一条累计打卡规则（界面与测试都用这个，保证跟库里的读法一致）。"""
         deadline_date = _parse_date(deadline) if not isinstance(deadline, date) else deadline
         return cls(task_type=TYPE_CUMULATIVE,
                    target_count=max(1, min(MAX_TARGET_COUNT, int(target_count))),
                    deadline=deadline_date,
-                   remind_time=parse_hhmm(remind_time, DEFAULT_REMIND_TIME))
+                   remind_time=parse_hhmm(remind_time, DEFAULT_REMIND_TIME),
+                   auto_target=(auto_target or "").strip() or None,
+                   auto_minutes=auto_minutes)
 
     @classmethod
     def daily(cls, start: str = DEFAULT_START, end: str = DEFAULT_END,
@@ -493,6 +546,17 @@ class TaskRule:
             text += f" · 截止 {self.deadline:%Y-%m-%d}"
         text += f" · 每天 {format_hhmm(self.remind_time or time(18, 0))} 提醒"
         return text
+
+    @property
+    def auto_enabled(self) -> bool:
+        """是否开启了"监控时长达标自动打卡"。"""
+        return bool(self.auto_target) and self.is_cumulative
+
+    def auto_checkin_text(self) -> str:
+        """自动打卡的一句话说明（没开启时返回空串）。"""
+        if not self.auto_enabled:
+            return ""
+        return f"自动打卡：{self.auto_target} 今日累计满 {self.auto_minutes or DEFAULT_AUTO_MINUTES} 分钟"
 
     def occurs_on(self, day: date) -> bool:
         """``day`` 这一天是否需要做这件事（生效日之前一律为否）。"""

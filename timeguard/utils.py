@@ -12,6 +12,42 @@ from pathlib import Path
 from typing import Any
 
 
+# ---------------------------------------------------------------- 监控对象匹配
+def match_target_seconds(target_seconds: dict, needle: str) -> tuple[str, float] | None:
+    """在"今日各监控对象时长"里找匹配项，返回 ``(名字, 秒数)``；没命中返回 ``None``。
+
+    匹配规则（都忽略大小写、忽略首尾空格），刻意做得**可预期**：
+
+    1. 名字与关键词完全相同 → 命中；
+    2. 名字里包含关键词（``"高数"`` 命中 ``"高数 - 学习"``）→ 命中；
+    3. 关键词里包含名字（用户把关键词写长了一点，例如填了
+       ``"哔哩哔哩动画"`` 而监控对象叫 ``"哔哩哔哩"``）→ 命中。
+
+    命中多个对象时**把时长加起来**：引擎每一秒只会记到一个对象上，所以这里相加
+    不会重复计算，反而能把"高数"主题下的几个关键字对象合起来算总时长 ——
+    这正是用户想要的（学了就是学了，别因为关键字写法不同漏掉）。名字取时长最大的
+    那个，便于在打卡备注里写清是谁触发的。
+    """
+    key = (needle or "").strip().lower()
+    if not key or not target_seconds:
+        return None
+    total = 0.0
+    best_name = ""
+    best_seconds = -1.0
+    for name, seconds in target_seconds.items():
+        name_l = (name or "").strip().lower()
+        if not name_l or not (name_l == key or key in name_l or name_l in key):
+            continue
+        try:
+            value = float(seconds or 0.0)
+        except (TypeError, ValueError):
+            continue
+        total += value
+        if value > best_seconds:
+            best_seconds, best_name = value, name
+    return (best_name, total) if best_name else None
+
+
 # ---------------------------------------------------------------- 控制台编码
 def use_utf8_console() -> None:
     """把标准输出/错误切到 UTF-8，避免中文在非中文 Windows 上把程序打崩。

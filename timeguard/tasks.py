@@ -21,13 +21,16 @@ from . import phrases
 from .database import Task, TaskLog, UsageStore
 from .datepicker import DatePicker, DateTimePicker, backend_name, quick_datetime
 from .recurrence import (
+    DEFAULT_AUTO_MINUTES,
     DEFAULT_END,
     DEFAULT_REMIND_BEFORE,
     DEFAULT_REMIND_TIME,
     DEFAULT_START,
     DEFAULT_TARGET_COUNT,
+    MAX_AUTO_MINUTES,
     MAX_REMIND_BEFORE,
     MAX_TARGET_COUNT,
+    MIN_AUTO_MINUTES,
     MIN_REMIND_BEFORE,
     STATE_DONE_DEADLINE as R_STATE_DONE_DEADLINE,
     STATE_DONE_EARLY as R_STATE_DONE_EARLY,
@@ -408,6 +411,9 @@ class TaskDraft:
     target_count: int = DEFAULT_TARGET_COUNT
     deadline: date | None = None
     remind_time: str = DEFAULT_REMIND_TIME
+    #: 累计打卡任务（可选）：监控对象名 + 时长阈值 → 达标自动打卡
+    auto_target: str = ""
+    auto_minutes: int = DEFAULT_AUTO_MINUTES
 
     @property
     def is_recurring(self) -> bool:
@@ -431,7 +437,9 @@ class TaskDraft:
             return TaskRule.weekly(self.days_of_week, self.time_start, self.time_end,
                                    self.remind_before_minutes)
         if self.task_type == TYPE_CUMULATIVE:
-            return TaskRule.cumulative(self.target_count, self.deadline, self.remind_time)
+            return TaskRule.cumulative(self.target_count, self.deadline, self.remind_time,
+                                       auto_target=self.auto_target or None,
+                                       auto_minutes=self.auto_minutes)
         return TaskRule(TYPE_ONCE)
 
     def preview_text(self, now: datetime | None = None) -> str:
@@ -486,6 +494,8 @@ class TaskDraft:
             parts.append(f"每天 {self.remind_time} 提醒")
         if days >= 0:
             parts.append("截止日之前只显示「今日未打卡 / 还差 X 次」，不会算逾期")
+        if self.auto_target:
+            parts.append(f"监控「{self.auto_target}」今日满 {self.auto_minutes} 分钟自动打卡")
         return " · ".join(parts)
 
 
@@ -498,12 +508,15 @@ class TaskDialog(tk.Toplevel):
         master: tk.Misc,
         font_family: str = "Microsoft YaHei UI",
         task: Task | None = None,
+        target_names: list[str] | None = None,
     ) -> None:
         super().__init__(master)
         #: 确认后是一个 :class:`TaskDraft`，取消为 ``None``
         self.result: TaskDraft | None = None
         self.font_family = font_family
         self.font_body = (font_family, 10)
+        #: "自动打卡"下拉框的候选：最近监控过的对象名（由调用方从库里取）
+        self.target_names = list(target_names or [])
         self.title("编辑待办任务" if task else "添加待办任务")
         self.configure(bg=PANEL)
         self.resizable(False, False)
@@ -675,6 +688,28 @@ class TaskDialog(tk.Toplevel):
                   text="　每天到点提醒一次「该打卡了」；达标或过了截止日就自动停止提醒",
                   style="CardHint.TLabel").pack(side="left", padx=(8, 0))
 
+        # 自动打卡（可选）：监控对象 + 时长阈值
+        auto_row = ttk.Frame(self.cum_frame, style="Card.TFrame")
+        auto_row.grid(row=4, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(auto_row, text="自动打卡（可选）：", style="Card.TLabel").pack(side="left")
+        self.auto_var = tk.StringVar(value=rule.auto_target or "")
+        style_dark_combobox(auto_row)
+        self.auto_box = ttk.Combobox(auto_row, width=16, textvariable=self.auto_var,
+                                     font=self.font_body, style="Dark.TCombobox",
+                                     values=self.target_names or ())
+        self.auto_box.pack(side="left")
+        self.auto_box.bind("<<ComboboxSelected>>", lambda _e: self._update_preview())
+        self.auto_box.bind("<KeyRelease>", lambda _e: self._update_preview())
+        ttk.Label(auto_row, text="  今日累计满 ", style="CardHint.TLabel").pack(side="left")
+        self.auto_minutes_var = tk.StringVar(
+            value=str(rule.auto_minutes or DEFAULT_AUTO_MINUTES))
+        self.auto_minutes_entry = ttk.Entry(auto_row, textvariable=self.auto_minutes_var,
+                                            width=5, font=self.font_body)
+        self.auto_minutes_entry.pack(side="left")
+        self.auto_minutes_entry.bind("<KeyRelease>", lambda _e: self._update_preview())
+        ttk.Label(auto_row, text=" 分钟就自动打一次卡（留空＝只手动打卡）",
+                  style="CardHint.TLabel").pack(side="left")
+
         # ---- 预览 + 优先级 ----
         ttk.Label(body, textvariable=self.preview_var, style="CardHint.TLabel",
                   wraplength=620, justify="left").grid(row=5, column=0, sticky="w", pady=(12, 0))
@@ -780,6 +815,21 @@ class TaskDialog(tk.Toplevel):
             return None
         return value
 
+    def _parse_auto_minutes(self) -> int | None:
+        """解析"自动打卡"的分钟阈值；留空 = 关闭自动打卡。"""
+        if not self.auto_var.get().strip():
+            return None                       # 没填监控对象 = 不开这个功能
+        raw = self.auto_minutes_var.get().strip()
+        if not raw:
+            return DEFAULT_AUTO_MINUTES
+        try:
+            value = int(float(raw))
+        except ValueError:
+            return -1                         # 用 -1 表示"填了但非法"
+        if value < MIN_AUTO_MINUTES or value > MAX_AUTO_MINUTES:
+            return -1
+        return value
+
     def _draft(self) -> TaskDraft:
         """把界面上的值收集成草稿（不做阻断式校验）。"""
         remind = self._parse_remind()
@@ -787,6 +837,7 @@ class TaskDialog(tk.Toplevel):
         days = (format_iso_weekdays([iso for iso, var in self.day_vars.items() if var.get()])
                 if task_type == TYPE_WEEKLY else "")
         target = self._parse_target()
+        auto_minutes = self._parse_auto_minutes()
         return TaskDraft(
             title=self.title_var.get().strip(),
             due_at=self.picker.get(),
@@ -799,6 +850,8 @@ class TaskDialog(tk.Toplevel):
             target_count=DEFAULT_TARGET_COUNT if target is None else target,
             deadline=self.deadline_picker.get_date(),
             remind_time=self.remind_time_field.get_text(),
+            auto_target=self.auto_var.get().strip(),
+            auto_minutes=(DEFAULT_AUTO_MINUTES if auto_minutes in (None, -1) else auto_minutes),
         )
 
     # ------------------------------------------------------------------ 位置 / 结果
@@ -839,6 +892,15 @@ class TaskDialog(tk.Toplevel):
                     parent=self,
                 ):
                     return
+            if self._parse_auto_minutes() == -1:
+                messagebox.showinfo(
+                    "提示",
+                    f"「自动打卡」的分钟数请填写 {MIN_AUTO_MINUTES}~{MAX_AUTO_MINUTES} 之间的整数，"
+                    "或者把监控对象留空（＝只手动打卡）。",
+                    parent=self,
+                )
+                self.auto_minutes_entry.focus_set()
+                return
         elif task_type != TYPE_ONCE:
             if self._parse_remind() is None:
                 messagebox.showinfo(
@@ -870,6 +932,127 @@ class TaskDialog(tk.Toplevel):
 
     def _cancel(self) -> None:
         """取消并关闭。"""
+        self.result = None
+        self.destroy()
+
+
+# ================================================================ 补签对话框
+class BackfillDialog(tk.Toplevel):
+    """补签：给累计打卡任务补一个"过去某一天"的打卡（可写备注）。
+
+    为什么要有它：人总会忘。忘了就断一天，热力图上缺口很难看，也影响"攒次数"的信心。
+    但补签必须是**显式**的、要写备注的 —— 否则"打卡"就失去意义了。
+
+    合法范围由数据层把关：只能补【任务创建之后、今天之前】的日子，同一天只能一次。
+    """
+
+    WIDTH = 460
+
+    def __init__(self, master: tk.Misc, task: Task, store: UsageStore,
+                 font_family: str = "Microsoft YaHei UI") -> None:
+        super().__init__(master)
+        #: 确认后是 ``(日期, 备注)``，取消为 ``None``
+        self.result: tuple[date, str] | None = None
+        self.task = task
+        self.store = store
+        self.font_family = font_family
+        self.font_body = (font_family, 10)
+        self.title("补签打卡")
+        self.configure(bg=PANEL)
+        self.resizable(False, False)
+        self.transient(master)
+        try:
+            self.attributes("-toolwindow", True)
+        except tk.TclError:
+            pass
+        self.protocol("WM_DELETE_WINDOW", self._cancel)
+
+        self._build()
+        self.bind("<Escape>", lambda _e: self._cancel())
+        self.bind("<Return>", lambda _e: self._confirm())
+        self._center(master)
+        self.grab_set()
+
+    def _build(self) -> None:
+        body = ttk.Frame(self, style="Card.TFrame", padding=16)
+        body.pack(fill="both", expand=True)
+
+        ttk.Label(body, text=f"补签：{self.task.title}", style="CardTitle.TLabel",
+                  font=(self.font_family, 13, "bold")).pack(anchor="w")
+        already = self.store.checkin_count(self.task.id)
+        target = self.task.rule.target_count or 1
+        ttk.Label(body, text=f"当前已打卡 {already}/{target} 次　·　"
+                             f"只能补【任务创建之后、今天之前】的日子，每天一次",
+                  style="CardHint.TLabel").pack(anchor="w", pady=(2, 10))
+
+        row = ttk.Frame(body, style="Card.TFrame")
+        row.pack(anchor="w")
+        ttk.Label(row, text="补哪一天：", style="Card.TLabel").pack(side="left")
+        self.picker = DatePicker(row, font_family=self.font_family, style_prefix="Card")
+        self.picker.pack(side="left")
+        # 默认补昨天（最常见的场景）；更早的日子用户自己选
+        default_day = date.today() - timedelta(days=1)
+        created = self.task.created_at.date() if self.task.created_at else None
+        if created is not None and default_day < created:
+            default_day = created if created <= date.today() else date.today()
+        self.picker.set_date(default_day)
+
+        quick = ttk.Frame(body, style="Card.TFrame")
+        quick.pack(anchor="w", pady=(6, 10))
+        ttk.Label(quick, text="快捷：", style="CardHint.TLabel").pack(side="left")
+        for label, offset in (("昨天", 1), ("前天", 2), ("3 天前", 3), ("一周前", 7)):
+            ttk.Button(quick, text=label, style="Tiny.TButton",
+                       command=lambda o=offset: self.picker.set_date(date.today() - timedelta(days=o))
+                       ).pack(side="left", padx=(0, 4))
+
+        ttk.Label(body, text="备注（会记进打卡历史）", style="Card.TLabel").pack(anchor="w")
+        self.note_var = tk.StringVar(value="")
+        self.note_entry = ttk.Entry(body, textvariable=self.note_var, width=46,
+                                    font=self.font_body)
+        self.note_entry.pack(anchor="w", pady=(4, 0))
+        ttk.Label(body, text="例如：昨天忘了打卡，补上（备注可留空）",
+                  style="CardHint.TLabel").pack(anchor="w", pady=(2, 0))
+
+        buttons = ttk.Frame(body, style="Card.TFrame")
+        buttons.pack(fill="x", pady=(14, 0))
+        ttk.Button(buttons, text="取消", style="Small.TButton",
+                   command=self._cancel).pack(side="right")
+        ttk.Button(buttons, text="确认补签", style="Accent.TButton",
+                   command=self._confirm).pack(side="right", padx=(0, 8))
+        self.note_entry.focus_set()
+
+    def _center(self, master: tk.Misc) -> None:
+        self.update_idletasks()
+        width, height = self.winfo_reqwidth(), self.winfo_reqheight()
+        try:
+            x = master.winfo_rootx() + max(0, (master.winfo_width() - width) // 2)
+            y = master.winfo_rooty() + max(0, (master.winfo_height() - height) // 3)
+        except tk.TclError:
+            x = y = 200
+        self.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+    def _confirm(self) -> None:
+        day = self.picker.get_date()
+        if day is None:
+            messagebox.showinfo("提示", "请选择要补签的日期。", parent=self)
+            return
+        if day > date.today():
+            messagebox.showinfo("提示", "不能给未来的日子补签。", parent=self)
+            return
+        if day == date.today():
+            messagebox.showinfo("提示", "今天请直接用「✓ 打卡」，补签只用于过去的日期。", parent=self)
+            return
+        created = self.task.created_at.date() if self.task.created_at else None
+        if created is not None and day < created:
+            messagebox.showinfo(
+                "提示",
+                f"这条任务是 {created:%Y-%m-%d} 创建的，{day:%Y-%m-%d} 那天它还不存在，不能补签。",
+                parent=self)
+            return
+        self.result = (day, self.note_var.get().strip())
+        self.destroy()
+
+    def _cancel(self) -> None:
         self.result = None
         self.destroy()
 
@@ -1229,6 +1412,7 @@ class TaskPanel(ttk.Frame):
         self.detail = CumulativeDetail(
             self.detail_frame, font_family=self.font_family,
             on_check_in=self._detail_check_in, on_undo=self._detail_undo,
+            on_backfill=self._detail_backfill,
         )
         self.detail.pack(fill="both", expand=True)
         self._detail_visible = False
@@ -1239,6 +1423,7 @@ class TaskPanel(ttk.Frame):
                                     font=self.font_body, bd=0)
         self.context_menu.add_command(label="标记完成 / 取消完成", command=self.toggle_selected)
         self.context_menu.add_command(label="✓ 打卡 / 撤销今天的打卡", command=self.check_in_selected)
+        self.context_menu.add_command(label="📝 补签过去的某一天…", command=self.backfill_selected)
         self.context_menu.add_command(label="编辑任务", command=self.edit_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="延后 1 小时", command=lambda: self.postpone_selected(60))
@@ -1369,7 +1554,11 @@ class TaskPanel(ttk.Frame):
             if want_detail:
                 self.paned.forget(self.chart_frame)
                 self.paned.add(self.detail_frame, weight=6)
+                # 刚 add 进去时 paned 的高度还是旧值（布局没落定），
+                # 所以先试一次，再 after_idle 校正一次 —— 否则算出来的
+                # "还差多少像素"是错的，最下面那行按钮就留在可视区外了。
                 self._ensure_detail_height()
+                self.after_idle(self._ensure_detail_height)
             else:
                 self.paned.forget(self.detail_frame)
                 self.paned.add(self.chart_frame, weight=6)
@@ -1385,20 +1574,24 @@ class TaskPanel(ttk.Frame):
             except tk.TclError:
                 log.debug("清空打卡详情失败", exc_info=True)
 
-    def _ensure_detail_height(self, needed: int = 205) -> None:
-        """打卡详情面板需要约 200px：不够就把分隔条往下推一点。
+    def _ensure_detail_height(self) -> None:
+        """给打卡详情面板腾出它**自己要求**的高度（不够就把分隔条往下推）。
 
-        不这么做的话，热力图底部那行月份刻度会被裁掉（实测在 728 高的屏上
-        下半窗格只有 ~150px）。列表仍保留至少 90px，不会被挤没。
+        为什么不写死一个常数：详情面板的高度取决于字体缩放（133% 缩放下实测 201px），
+        写死 205 在别的缩放下就会把最下面那行按钮裁掉。这里直接问控件要
+        ``winfo_reqheight()``，再留 8px 余量，并且给列表保底 90px。
         """
         try:
+            self.update_idletasks()       # 先让布局落定，否则量到的高度是旧值
+            needed = max(180, min(300, int(self.detail.winfo_reqheight()) + 8))
             height = self.paned.winfo_height()
-            if height < 260:
-                return
+            if height < 220:
+                return                    # 窗口太矮：两边都放不下，交给用户自己拖
             sash = self.paned.sashpos(0)
             if height - sash >= needed:
                 return
             self.paned.sashpos(0, max(90, height - needed))
+            log.debug("打卡详情需要 %dpx，已把分隔条推到 %d", needed, self.paned.sashpos(0))
         except tk.TclError:
             log.debug("调整打卡详情高度失败", exc_info=True)
 
@@ -1416,6 +1609,35 @@ class TaskPanel(ttk.Frame):
     def _detail_check_in(self, task_id: int) -> tuple[bool, str]:
         """详情面板里的「✓ 打卡」——和列表按钮走同一条路径。"""
         return self._do_check_in(task_id)
+
+    def _detail_backfill(self, task_id: int) -> tuple[bool, str]:
+        """详情面板里的「📝 补签…」：选日期 + 写备注，然后交给数据层判定。"""
+        task = self.store.get_task(task_id)
+        if task is None:
+            return False, "任务不存在"
+        dialog = BackfillDialog(self, task, self.store, font_family=self.font_family)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return False, "已取消补签"
+        day, note = dialog.result
+        ok, message = self.store.check_in(task_id, day, note=note)
+        if ok:
+            self.refresh()
+            self._reschedule_tasks()
+            self._notify_app(f"{task.title}：{message}")
+        return ok, message
+
+    def backfill_selected(self) -> None:
+        """右键菜单里的「📝 补签」：对选中的打卡任务补签。"""
+        row = self._require_row()
+        if row is None:
+            return
+        if not row.is_cumulative:
+            messagebox.showinfo("提示", f"「{row.task.title}」不是累计打卡任务。", parent=self)
+            return
+        ok, message = self._detail_backfill(row.task.id)
+        if not ok and message != "已取消补签":
+            messagebox.showinfo("提示", message, parent=self)
 
     def _detail_undo(self, task_id: int) -> tuple[bool, str]:
         """详情面板里的「撤销今日打卡」。"""
@@ -1718,10 +1940,13 @@ class TaskPanel(ttk.Frame):
             label = "标记完成 / 取消完成"
         try:
             self.context_menu.entryconfigure(0, label=label)
+            # 「补签」只对累计打卡任务可用
+            self.context_menu.entryconfigure(
+                2, state="normal" if (task is not None and task.is_cumulative) else "disabled")
             postpone_state = "disabled" if (task is None or task.is_recurring
                                             or task.is_cumulative) else "normal"
-            self.context_menu.entryconfigure(3, state=postpone_state)
             self.context_menu.entryconfigure(4, state=postpone_state)
+            self.context_menu.entryconfigure(5, state=postpone_state)
         except tk.TclError:
             log.debug("刷新右键菜单状态失败", exc_info=True)
         try:

@@ -213,11 +213,19 @@ def selftest() -> int:
         assert cum_task is not None and cum_task.is_cumulative
         assert cum_task.rule.target_count == 60 and cum_task.rule.remind_time is not None
         today = datetime.now().date()
-        store.check_in(cum_id, today - timedelta(days=1))
         first_ok, _ = store.check_in(cum_id, today)
         second_ok, second_msg = store.check_in(cum_id, today)      # 同一天只能打一次
         assert first_ok is True and second_ok is False, "同一天应该只能打卡一次"
-        assert store.checkin_count(cum_id) == 2
+        # 补签的边界：这条任务今天才建，昨天它还不存在 → 必须被拒绝
+        back_ok, back_msg = store.check_in(cum_id, today - timedelta(days=1))
+        assert back_ok is False and "早于任务创建日期" in back_msg, back_msg
+        assert store.checkin_count(cum_id) == 1
+        # 监控时长达标自动打卡（可选功能）：填了对象+阈值才算开启
+        assert store.update_task(cum_id, auto_target="高数", auto_minutes=30) is True
+        auto_rule = store.get_task(cum_id).rule
+        assert auto_rule.auto_enabled and auto_rule.auto_minutes == 30
+        assert rec_mod.auto_checkin_ready(auto_rule, 31 * 60)[0] is True
+        assert rec_mod.auto_checkin_ready(auto_rule, 10 * 60)[0] is False
         cum_status = store.task_status(cum_id)
         assert cum_status is not None and cum_status.is_running, cum_status
         assert "逾期" not in cum_status.status_text(), cum_status.status_text()
@@ -225,6 +233,8 @@ def selftest() -> int:
         report(f"[ OK ] 累计打卡任务正常（{cum_status.status_text()}；"
                f"{cum_status.progress_text()}；{cum_status.countdown_text()}）")
         report(f"[ OK ] 同一天重复打卡已被拦下（{second_msg}）")
+        report(f"[ OK ] 补签边界正常（{back_msg}）")
+        report(f"[ OK ] 自动打卡规则正常（{auto_rule.auto_checkin_text()}）")
         report("[ OK ] 截止日之前状态是「进行中」，不会出现「逾期」字样")
         store.delete_task(cum_id)
     except Exception as exc:  # noqa: BLE001

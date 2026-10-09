@@ -27,13 +27,16 @@ from pathlib import Path
 
 from . import paths
 from .recurrence import (
+    DEFAULT_AUTO_MINUTES,
     DEFAULT_END,
     DEFAULT_REMIND_BEFORE,
     DEFAULT_REMIND_TIME,
     DEFAULT_START,
     DEFAULT_TARGET_COUNT,
+    MAX_AUTO_MINUTES,
     MAX_REMIND_BEFORE,
     MAX_TARGET_COUNT,
+    MIN_AUTO_MINUTES,
     MIN_REMIND_BEFORE,
     TYPE_CUMULATIVE,
     TYPE_DAILY,
@@ -113,7 +116,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     -- ↓ v1.5 累计打卡任务（例如"年末前完成 60 次两公里跑"）
     target_count           INTEGER,                          -- 总目标次数，如 60
     deadline               TEXT,                             -- 最终截止日期 'YYYY-MM-DD'（含当天）
-    remind_time            TEXT                              -- 每日提醒时间 'HH:MM'
+    remind_time            TEXT,                             -- 每日提醒时间 'HH:MM'
+    auto_target            TEXT,                             -- 【可选】监控对象名（达标自动打卡）
+    auto_minutes           INTEGER                           -- 【可选】自动打卡的时长阈值（分钟）
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at);
@@ -175,6 +180,9 @@ _TASK_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("target_count", "INTEGER"),
     ("deadline", "TEXT"),
     ("remind_time", "TEXT"),
+    # v1.5.1 监控时长达标自动打卡（可选）
+    ("auto_target", "TEXT"),
+    ("auto_minutes", "INTEGER"),
 )
 
 #: 依赖新增列的索引：必须在补列之后再建，否则老库打开时会报 no such column
@@ -337,6 +345,21 @@ class Task:
     def is_cumulative(self) -> bool:
         """是否为累计打卡任务。"""
         return self.rule.is_cumulative
+
+
+def _coerce_auto(auto_target, auto_minutes) -> tuple[str | None, int | None]:
+    """归一化"自动打卡"的两个字段：没填监控对象就等于没开这个功能。
+
+    只填了对象没填分钟数 → 用默认值（30 分钟）；分钟数越界 → 夹到合法范围。
+    """
+    name = (str(auto_target).strip() if auto_target else "")
+    if not name:
+        return None, None
+    try:
+        minutes = int(auto_minutes) if auto_minutes not in (None, "") else DEFAULT_AUTO_MINUTES
+    except (TypeError, ValueError):
+        minutes = DEFAULT_AUTO_MINUTES
+    return name[:100], max(MIN_AUTO_MINUTES, min(MAX_AUTO_MINUTES, minutes))
 
 
 def _coerce_date(raw) -> date | None:
@@ -680,7 +703,9 @@ class UsageStore:
                  start_date: str | None = None,
                  target_count: int | None = None,
                  deadline: str | date | None = None,
-                 remind_time: str | None = None) -> int | None:
+                 remind_time: str | None = None,
+                 auto_target: str | None = None,
+                 auto_minutes: int | None = None) -> int | None:
         """新增待办任务，返回新任务 ID（失败返回 None）。
 
         :param task_type: ``once`` 单次 / ``daily`` 每天 / ``weekly`` 每周 / ``cumulative`` 累计打卡
@@ -694,6 +719,8 @@ class UsageStore:
         :param target_count: 累计打卡任务的总目标次数（如 60）
         :param deadline: 累计打卡任务的最终截止日期（**含当天**）
         :param remind_time: 累计打卡任务的每日提醒时间 ``'HH:MM'``
+        :param auto_target: 【可选】监控对象名：今日累计时长达标就自动打卡
+        :param auto_minutes: 【可选】自动打卡的时长阈值（分钟，默认 30）
         """
         title = (title or "").strip()
         if not title:
@@ -705,6 +732,7 @@ class UsageStore:
             time_start = time_end = days_of_week = None
             start_date = None
             target_count, deadline, remind_time = None, None, None
+            auto_target, auto_minutes = None, None
         elif task_type == TYPE_CUMULATIVE:
             # 累计打卡任务：只认"目标次数 + 截止日期 + 每日提醒时间"，
             # time_start/time_end/days_of_week 一律留空 —— 它没有"今天几点到几点做"的概念，
@@ -723,8 +751,10 @@ class UsageStore:
                 return None
             deadline = deadline_date.strftime("%Y-%m-%d")
             remind_time = format_hhmm(parse_hhmm(remind_time, DEFAULT_REMIND_TIME))
+            auto_target, auto_minutes = _coerce_auto(auto_target, auto_minutes)
         else:
             target_count, deadline, remind_time = None, None, None
+            auto_target, auto_minutes = None, None
             # 周期任务的时间由 time_start/time_end 表达，due_at 没有意义：
             # 留着它会让"单次任务按 due_at 排列表/统计"的口径被污染（图表里凭空多一条）。
             due_at = None
@@ -756,8 +786,9 @@ class UsageStore:
                     INSERT INTO tasks(title, due_at, created_at, completed, priority, note,
                                       task_type, time_start, time_end, days_of_week,
                                       remind_before_minutes, start_date,
-                                      target_count, deadline, remind_time)
-                    VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      target_count, deadline, remind_time,
+                                      auto_target, auto_minutes)
+                    VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         title[:200],
@@ -774,6 +805,8 @@ class UsageStore:
                         target_count,
                         deadline,
                         remind_time,
+                        auto_target,
+                        auto_minutes,
                     ),
                 )
                 self._conn.commit()
@@ -933,6 +966,23 @@ class UsageStore:
             rows = self._conn.execute(sql, params).fetchall()
         return [CheckInLog.from_row(row) for row in rows]
 
+    def monitored_target_names(self, days: int = 30) -> list[str]:
+        """最近监控过的对象名（按累计时长从多到少）—— 给"自动打卡"下拉框做候选。
+
+        没有这一项的话，用户得凭记忆把监控对象名一字不差地敲进去，很容易打不上卡。
+        """
+        start = last_n_days(max(1, int(days)))[0]
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT target_name, SUM(seconds) AS s FROM daily_target
+                WHERE day >= ? AND target_name <> ''
+                GROUP BY target_name ORDER BY s DESC LIMIT 40
+                """,
+                (start,),
+            ).fetchall()
+        return [str(row["target_name"]) for row in rows]
+
     def checkin_ids_on(self, day: date | str) -> set[int]:
         """``day`` 这一天打过卡的任务 id 集合（一次查询，列表/统计用）。"""
         key = day.strftime("%Y-%m-%d") if isinstance(day, date) else str(day)[:10]
@@ -974,6 +1024,10 @@ class UsageStore:
 
         日期边界（避坑 #2）：``day`` 缺省时取**本地时间** ``date.today()``，
         也就是自然日 00:00~23:59:59 —— 凌晨 00:10 打卡算新的一天，不会算到昨天。
+
+        关于**补签**（``day`` 传过去的某一天、``source="backfill"``）：
+        允许补，但只允许补"任务创建之后、今天之前"的日子 —— 未来还没发生，
+        创建之前这条任务根本不存在，两种都不给补（界面会挡，这里也挡一道）。
         """
         task = self.get_task(int(task_id))
         if task is None:
@@ -994,6 +1048,15 @@ class UsageStore:
             target_day = stamp.date()
         if task.rule.is_expired(target_day):
             return False, f"已过截止日期（{task.rule.deadline:%Y-%m-%d}），不能再打卡"
+        today = date.today()
+        if target_day > today:
+            return False, f"{target_day:%m-%d} 还没到，不能提前打卡"
+        backfill = target_day < today
+        if backfill and task.created_at is not None and target_day < task.created_at.date():
+            return False, (f"{target_day:%m-%d} 早于任务创建日期"
+                           f"（{task.created_at:%Y-%m-%d}），不能补签")
+        if backfill and not source or source == "manual" and backfill:
+            source = "backfill"          # 补签自动打上标记，方便日后分辨
         with self._lock:
             try:
                 self._conn.execute(
@@ -1013,11 +1076,13 @@ class UsageStore:
                 return False, "打卡失败（数据库错误，详见日志）"
         total = self.checkin_count(task_id)
         status = cumulative_status(task.rule, self.checkin_dates(task_id))
-        log.info("累计打卡：任务 #%s %s 打卡成功（%s/%s，%s）",
-                 task_id, target_day, total, status.target, status.state)
+        kind = "补签" if source == "backfill" else ("自动打卡" if source == "auto" else "打卡")
+        log.info("累计打卡：任务 #%s %s %s成功（%s/%s，%s）",
+                 task_id, target_day, kind, total, status.target, status.state)
+        prefix = f"{target_day:%m-%d} {kind}成功！" if backfill else f"{kind}成功！"
         if status.finished:
-            return True, f"打卡成功！{status.progress_text()} —— {status.state_label}"
-        return True, f"打卡成功！{status.progress_text()}，还差 {status.remaining} 次"
+            return True, f"{prefix}{status.progress_text()} —— {status.state_label}"
+        return True, f"{prefix}{status.progress_text()}，还差 {status.remaining} 次"
 
     def undo_check_in(self, task_id: int, day: date | str | None = None) -> bool:
         """撤销某一天的打卡（点错了可以退回；也用于测试）。"""
@@ -1190,6 +1255,9 @@ class UsageStore:
                     target_count: int | None = None,
                     deadline: str | date | None = None,
                     remind_time: str | None = None,
+                    auto_target: str | None = None,
+                    auto_minutes: int | None = None,
+                    clear_auto: bool = False,
                     clear_due: bool = False) -> bool:
         """修改任务（只更新传入的字段）。
 
@@ -1197,6 +1265,9 @@ class UsageStore:
         :param target_count: 累计打卡任务的目标次数
         :param deadline: 累计打卡任务的截止日期
         :param remind_time: 累计打卡任务的每日提醒时间
+        :param auto_target: 【可选】监控对象名（达标自动打卡）
+        :param auto_minutes: 【可选】自动打卡的时长阈值（分钟）
+        :param clear_auto: 关掉"自动打卡"（把两个字段都清空）
         """
         fields: list[str] = []
         values: list[object] = []
@@ -1236,7 +1307,8 @@ class UsageStore:
             if task_type == TYPE_ONCE:
                 # 变回单次任务：清掉周期字段，避免语义混淆
                 fields += ["time_start = NULL", "time_end = NULL", "days_of_week = NULL",
-                           "target_count = NULL", "deadline = NULL", "remind_time = NULL"]
+                           "target_count = NULL", "deadline = NULL", "remind_time = NULL",
+                           "auto_target = NULL", "auto_minutes = NULL"]
             elif task_type == TYPE_CUMULATIVE:
                 # 改成累计打卡：周期字段必须清掉，否则会多出一份"假计划"，
                 # 让窗口判定 / 列表文案 / 统计口径全部对不上。
@@ -1257,8 +1329,10 @@ class UsageStore:
             if task_type in (TYPE_DAILY, TYPE_WEEKLY):
                 # 从"累计打卡"改回周期任务：打卡字段必须清掉，
                 # 否则库里留着 target_count/deadline，界面和统计会各读一半。
-                fields += ["target_count = NULL", "deadline = NULL", "remind_time = NULL"]
+                fields += ["target_count = NULL", "deadline = NULL", "remind_time = NULL",
+                           "auto_target = NULL", "auto_minutes = NULL"]
                 target_count = deadline = remind_time = None
+                auto_target = auto_minutes = None
         if time_start is not None:
             fields.append("time_start = ?")
             values.append(format_hhmm(parse_hhmm(time_start, DEFAULT_START)))
@@ -1294,6 +1368,16 @@ class UsageStore:
         if remind_time is not None:
             fields.append("remind_time = ?")
             values.append(format_hhmm(parse_hhmm(remind_time, DEFAULT_REMIND_TIME)))
+        if clear_auto:
+            fields += ["auto_target = NULL", "auto_minutes = NULL"]
+        elif auto_target is not None:
+            # 只填了对象没填分钟 → 用默认阈值；填了对象就一起写两个字段
+            name, minutes = _coerce_auto(auto_target, auto_minutes)
+            fields += ["auto_target = ?", "auto_minutes = ?"]
+            values += [name, minutes]
+        elif auto_minutes is not None:
+            fields.append("auto_minutes = ?")
+            values.append(max(MIN_AUTO_MINUTES, min(MAX_AUTO_MINUTES, int(auto_minutes))))
 
         # ---- 生效起始日：改了"周期/时间段"就要重算 ----
         # 用户预期：把时间段改成"今天已经过去"的那种（比如晚上改成 06:00~08:00），

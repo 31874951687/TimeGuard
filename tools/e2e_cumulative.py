@@ -31,7 +31,7 @@ from timeguard import recurrence as R  # noqa: E402
 from timeguard import winapi  # noqa: E402
 from timeguard.config import Config  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
-from timeguard.engine import UsageEngine  # noqa: E402
+from timeguard.engine import Snapshot, UsageEngine  # noqa: E402
 from timeguard.notifier import Notifier  # noqa: E402
 from timeguard.scheduler import KIND_CHECKIN, compute_schedule  # noqa: E402
 from timeguard.tasks import GROUP_CHECKIN, build_task_rows  # noqa: E402
@@ -153,6 +153,13 @@ def main() -> int:
             finish(1)
             return
         task = tasks[0]
+        # 把创建时间往前挪 90 天：下面要造 45 次历史打卡，而"补签"规则不允许补到
+        # 任务创建之前（数据层的真实约束），所以这条演示任务必须"早就建好了"。
+        store._conn.execute(                       # noqa: SLF001
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            ((datetime.now() - timedelta(days=90)).strftime("%Y-%m-%d %H:%M:%S"), task.id))
+        store._conn.commit()                       # noqa: SLF001
+        task = store.get_task(task.id)
         check("切换类型时只显示累计打卡那一栏",
               captured.get("frames") == (False, False, True), str(captured.get("frames")))
         check("预览写清了目标/截止/提醒，并说明不会提前算逾期",
@@ -307,33 +314,41 @@ def main() -> int:
         # 上面这次会被"同一天只能打一次"挡下（今天已经打过），正好验证防重复
         check("23:50 打卡仍算「今天」（被同一天去重规则挡下）", ok_night is False)
 
+        # 压哨：把"最后一天"设成今天，前两次打卡放在过去（未来日期数据层会拒绝）
         fresh = store.add_task("压哨测试", task_type=R.TYPE_CUMULATIVE, target_count=3,
-                               deadline=(today + timedelta(days=2)).strftime("%Y-%m-%d"),
-                               remind_time="18:00")
-        for day in (today, today + timedelta(days=1)):
-            store.check_in(fresh, day)
+                               deadline=today.strftime("%Y-%m-%d"), remind_time="18:00")
+        store._conn.execute(                       # noqa: SLF001
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            ((datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"), fresh))
+        store._conn.commit()                       # noqa: SLF001
+        for day in (today - timedelta(days=2), today - timedelta(days=1)):
+            ok_day, msg_day = store.check_in(fresh, day)
+            check(f"补上 {day:%m-%d} 那一次打卡", ok_day, msg_day)
         rule = store.get_task(fresh).rule
         dates = store.checkin_dates(fresh)
-        on_deadline = R.cumulative_status(rule, dates, today + timedelta(days=2))
+        on_deadline = R.cumulative_status(rule, dates, today)
         check("截止日当天没攒够 → 仍是「进行中」（今天还能打）",
               on_deadline.state == R.STATE_RUNNING and "逾期" not in on_deadline.status_text(),
               on_deadline.status_text())
-        ok_last, _ = store.check_in(fresh, today + timedelta(days=2))
-        after = R.cumulative_status(rule, store.checkin_dates(fresh), today + timedelta(days=2))
+        ok_last, msg_last = store.check_in(fresh, today)
+        after = R.cumulative_status(rule, store.checkin_dates(fresh), today)
         check("截止日当天打满 → 压哨完成（不是逾期）",
-              ok_last and after.state == R.STATE_DONE_DEADLINE, after.state_label)
+              ok_last and after.state == R.STATE_DONE_DEADLINE, f"{after.state_label}（{msg_last}）")
 
         late_task = store.add_task("逾期测试", task_type=R.TYPE_CUMULATIVE, target_count=3,
-                                   deadline=(today + timedelta(days=1)).strftime("%Y-%m-%d"),
+                                   deadline=(today - timedelta(days=1)).strftime("%Y-%m-%d"),
                                    remind_time="18:00")
-        store.check_in(late_task, today)
+        store._conn.execute(                       # noqa: SLF001
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            ((datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d %H:%M:%S"), late_task))
+        store._conn.commit()                       # noqa: SLF001
+        store.check_in(late_task, today - timedelta(days=2))
         late_rule = store.get_task(late_task).rule
-        late_status = R.cumulative_status(late_rule, store.checkin_dates(late_task),
-                                         today + timedelta(days=2))
+        late_status = R.cumulative_status(late_rule, store.checkin_dates(late_task), today)
         check("今天 > 截止日 且没攒够 → 这时才判「逾期未达标」",
               late_status.state == R.STATE_MISSED and "逾期未达标" in late_status.status_text(),
               late_status.status_text())
-        blocked, blocked_msg = store.check_in(late_task, today + timedelta(days=2))
+        blocked, blocked_msg = store.check_in(late_task, today)
         check("过了截止日不能再打卡", blocked is False and "已过截止日期" in blocked_msg, blocked_msg)
         check("逾期后不计入「提前完成」", store.get_task(late_task).completed is False)
 
@@ -348,6 +363,143 @@ def main() -> int:
         check("批量取次数与历史（列表刷新不 N+1）",
               store.checkin_counts().get(task.id) == 60
               and len(store.checkin_dates_map().get(task.id, [])) == 60)
+
+        # ---------------------------------------------------------- 补签（v1.5.1）
+        print("-- 6) 补签：手动选历史日期 + 备注 --")
+        bf_task = store.add_task("补签演示：每天背 30 个单词", task_type=R.TYPE_CUMULATIVE,
+                                 target_count=30,
+                                 deadline=(today + timedelta(days=45)).strftime("%Y-%m-%d"),
+                                 remind_time="20:00")
+        # 把创建时间往前挪 20 天，模拟"这条任务早就建好了"（否则没有可补的日子）
+        store._conn.execute(                       # noqa: SLF001
+            "UPDATE tasks SET created_at = ? WHERE id = ?",
+            ((datetime.now() - timedelta(days=20)).strftime("%Y-%m-%d %H:%M:%S"), bf_task))
+        store._conn.commit()                       # noqa: SLF001
+        panel.refresh()
+        select_task(bf_task)
+        pump(0.5)
+
+        real_backfill = tasks_mod.BackfillDialog
+        bf_captured: dict = {}
+
+        class AutoBackfill(real_backfill):          # type: ignore[valid-type,misc]
+            def __init__(self, master, task, store_, **kw):     # noqa: ANN001, ANN003
+                super().__init__(master, task, store_, **kw)
+                self.after(20, self._fill)
+
+            def _fill(self) -> None:
+                bf_captured["default_day"] = self.picker.get_date()
+                self.picker.set_date(today - timedelta(days=3))
+                self.note_var.set("三天前出差忘了打卡")
+                self._confirm()
+
+        tasks_mod.BackfillDialog = AutoBackfill          # type: ignore[assignment]
+        panel.backfill_selected()                        # 走右键菜单那条路径
+        tasks_mod.BackfillDialog = real_backfill         # type: ignore[assignment]
+        pump(0.8)
+
+        check("补签对话框默认给的是昨天",
+              bf_captured.get("default_day") == today - timedelta(days=1),
+              str(bf_captured.get("default_day")))
+        bf_log = store.checkin_log(bf_task, today - timedelta(days=3))
+        check("补签写进了打卡历史", bf_log is not None)
+        if bf_log is not None:
+            check("来源标记为「补签」，备注也存下来了",
+                  bf_log.source == "backfill" and bf_log.source_label == "补签"
+                  and bf_log.note == "三天前出差忘了打卡",
+                  f"{bf_log.source_label} / {bf_log.note}")
+        check("补签算进进度", store.checkin_count(bf_task) == 1)
+        bf_status = store.task_status(bf_task)
+        check("补签不影响「今天」的状态（今天仍未打卡）",
+              bf_status.today_checked is False and "今日未打卡" in bf_status.status_text(),
+              bf_status.status_text())
+        ok_future, msg_future = store.check_in(bf_task, today + timedelta(days=1))
+        check("补签不能补未来", ok_future is False and "还没到" in msg_future, msg_future)
+        ok_pre, msg_pre = store.check_in(bf_task, today - timedelta(days=30))
+        check("补签不能补任务创建之前", ok_pre is False and "早于任务创建日期" in msg_pre, msg_pre)
+
+        # ---------------------------------------------------------- 自动打卡（v1.5.1）
+        print("-- 7) 监控时长达标自动打卡（可选功能）--")
+        auto_task = store.add_task("高数刷题（自动打卡）", task_type=R.TYPE_CUMULATIVE,
+                                   target_count=10,
+                                   deadline=(today + timedelta(days=30)).strftime("%Y-%m-%d"),
+                                   remind_time="21:00", auto_target="高数", auto_minutes=30)
+        auto_rule = store.get_task(auto_task).rule
+        check("自动打卡的配置落库并读得出来",
+              auto_rule.auto_enabled and auto_rule.auto_minutes == 30
+              and auto_rule.auto_checkin_text() == "自动打卡：高数 今日累计满 30 分钟",
+              auto_rule.auto_checkin_text())
+
+        def run_auto_pass(targets) -> None:          # noqa: ANN001
+            # 用**真实的 Snapshot**（不是自己搓的假对象）：界面每秒的 tick 会读它的
+            # 其它字段，缺字段会让刷新直接抛异常（踩过一次）。
+            win.snapshot = Snapshot(day=today.strftime("%Y-%m-%d"), target_seconds=targets)
+            win._auto_check_in_pass()                # noqa: SLF001 - 直接跑那一趟
+            pump(0.3)
+
+        run_auto_pass({"高数": 20 * 60, "游戏": 3600})          # 还没到阈值
+        check("时长不够时不会自动打卡", store.checkin_count(auto_task) == 0,
+              f"{store.checkin_count(auto_task)} 次")
+        ready, why = R.auto_checkin_ready(auto_rule, 20 * 60)
+        check("规则也给出「还差多少分钟」的说明", ready is False and "还差 10 分钟" in why, why)
+
+        run_auto_pass({"高数 - 学习": 20 * 60, "高数": 11 * 60})  # 两个对象加起来 31 分钟
+        check("时长够了就自动打卡（多个匹配对象时长相加）",
+              store.checkin_count(auto_task) == 1, f"{store.checkin_count(auto_task)} 次")
+        auto_log = store.checkin_log(auto_task, today)
+        check("来源标记为「自动打卡」，备注写明是谁触发的",
+              auto_log is not None and auto_log.source == "auto"
+              and "自动打卡" in auto_log.note and "高数" in auto_log.note,
+              f"{auto_log.source_label if auto_log else '—'} / {auto_log.note if auto_log else '—'}")
+
+        run_auto_pass({"高数": 99 * 60})                          # 已经打过卡了
+        check("同一天不会再自动打第二次", store.checkin_count(auto_task) == 1,
+              f"{store.checkin_count(auto_task)} 次")
+
+        ignore_task = store.add_task("没开自动打卡的", task_type=R.TYPE_CUMULATIVE,
+                                     target_count=5,
+                                     deadline=(today + timedelta(days=30)).strftime("%Y-%m-%d"),
+                                     remind_time="21:00")
+        run_auto_pass({"高数": 99 * 60})
+        check("没配自动打卡的任务不会被误打", store.checkin_count(ignore_task) == 0)
+
+        # 快照是昨天的 → 整轮跳过（绝不能拿昨天的数据写今天的卡）
+        win.snapshot = Snapshot(day=(today - timedelta(days=1)).strftime("%Y-%m-%d"),
+                                target_seconds={"高数": 99 * 60})
+        store.undo_check_in(auto_task, today)
+        store.undo_check_in(auto_task, today)          # 撤两次，第二次无事发生
+        win._auto_check_in_pass()                      # noqa: SLF001
+        pump(0.3)
+        check("快照不是今天的 → 不写库（防串日）", store.checkin_count(auto_task) == 0,
+              f"{store.checkin_count(auto_task)} 次")
+        # 打回来，继续后面的统计断言
+        run_auto_pass({"高数": 31 * 60})
+        check("换回今天的快照后又能自动打卡",
+              store.checkin_count(auto_task) == 1, f"{store.checkin_count(auto_task)} 次")
+        panel.refresh()
+        pump(0.5)
+        select_task(auto_task)
+        pump(0.6)
+        check("详情面板把自动打卡规则写在计划行里",
+              "自动打卡" in panel.detail.plan_var.get()
+              or "自动打卡" in panel.detail.status_var.get()
+              or "30 分钟" in panel.detail.plan_var.get(),
+              panel.detail.plan_var.get())
+        # 排版断言：详情面板最下面那行按钮不能被裁掉（实测短窗口下会只剩一条边）
+        # 用**屏幕绝对坐标**比较：按钮底边不能超过详情面板的底边
+        detail = panel.detail
+        btn_bottom = detail.backfill_button.winfo_rooty() + detail.backfill_button.winfo_height()
+        frame_bottom = panel.detail_frame.winfo_rooty() + panel.detail_frame.winfo_height()
+        check("详情面板的按钮行没被裁切（在可见区域内）",
+              detail.backfill_button.winfo_ismapped() and 0 < btn_bottom <= frame_bottom,
+              f"按钮底边 {btn_bottom} / 面板底边 {frame_bottom}"
+              f"（面板高 {panel.detail_frame.winfo_height()}px，"
+              f"需要 {detail.winfo_reqheight()}px）")
+        check("进度条与热力图都画出来了",
+              detail.progress.winfo_ismapped() and detail.heatmap.winfo_ismapped()
+              and len(detail.heatmap.canvas.find_all()) > 0,
+              f"热力图元素 {len(detail.heatmap.canvas.find_all())} 个")
+        save_shot(win.root, "29_cumulative_auto")
 
         finish(0)
 

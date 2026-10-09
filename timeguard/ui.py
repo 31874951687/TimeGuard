@@ -32,6 +32,7 @@ from .config import Config
 from .database import UsageStore
 from .engine import Snapshot, UsageEngine
 from .notifier import Notifier, PopupManager
+from .recurrence import auto_checkin_ready
 from .scheduler import TaskScheduler
 from .settings_page import SettingsPage
 from .tasks import (
@@ -40,7 +41,7 @@ from .tasks import (
     TaskPanel,
     style_panedwindow,
 )
-from .utils import fmt_duration, today_str
+from .utils import fmt_duration, match_target_seconds, today_str
 
 log = logging.getLogger(__name__)
 
@@ -630,6 +631,77 @@ class MainWindow:
         """引擎回调（运行在监控线程）——只保存快照，界面由主线程刷新。"""
         self.snapshot = snapshot
 
+    def _auto_check_in_pass(self) -> None:
+        """「监控时长达标自动打卡」：拿引擎快照里的今日时长，够阈值就自动打一次卡。
+
+        为什么要**每秒**都能跑：引擎每秒产出一个快照，自动打卡必须跟着实时时长走；
+        但真正做事的只有"已经开了自动打卡、今天还没打卡、还没达标/过期"的任务，
+        绝大多数时候这里立刻就返回了。
+
+        三条例外（与手动打卡同一套口径，见 ``recurrence.auto_checkin_ready``）：
+
+        * 今天已经打过卡 → 跳过（同一天只算一次）；
+        * 已经攒够目标 / 已经过了截止日 → 跳过；
+        * 快照不是今天的 → 整轮跳过（手上可能还捏着昨天的数据，绝不能据此写库）。
+        """
+        snapshot = self.snapshot
+        if snapshot is None or not getattr(snapshot, "target_seconds", None):
+            return
+        today = datetime.now().date()
+        if getattr(snapshot, "day", "") and snapshot.day != today.strftime("%Y-%m-%d"):
+            return
+        try:
+            tasks = self.store.cumulative_tasks()
+        except Exception:  # noqa: BLE001 - 数据层异常不该打断界面刷新
+            log.debug("读取累计打卡任务失败", exc_info=True)
+            return
+        if not tasks:
+            return
+        try:
+            counts = self.store.checkin_counts()
+            checked = self.store.checkin_ids_on(today)
+        except Exception:  # noqa: BLE001
+            log.debug("读取打卡记录失败", exc_info=True)
+            return
+        fired = 0
+        for task in tasks:
+            rule = task.rule
+            if not rule.auto_enabled:
+                continue
+            if task.id in checked:
+                continue
+            target = max(1, int(rule.target_count or 1))
+            if int(counts.get(task.id, 0)) >= target or rule.is_expired(today):
+                continue
+            found = match_target_seconds(snapshot.target_seconds, rule.auto_target or "")
+            if found is None:
+                continue
+            name, seconds = found
+            ready, why = auto_checkin_ready(rule, seconds, checked_today=False, today=today)
+            if not ready:
+                continue
+            minutes = max(1, int(round(seconds / 60)))
+            ok, message = self.store.check_in(
+                task.id, today, note=f"自动打卡：{name} 今日已用 {minutes} 分钟", source="auto")
+            if not ok:
+                log.debug("自动打卡未写入（%s）：%s", task.title, message)
+                continue
+            fired += 1
+            log.info("累计打卡：任务「%s」自动打卡成功（%s；%s）", task.title, why, message)
+            # 注意用 MainWindow 自己的提示条接口（面板上的 _notify_app 是 TaskPanel 的方法）
+            self.show_toast_message(f"已自动打卡：{task.title}（{name} 今日 {minutes} 分钟）")
+            try:
+                self.notifier.notify("TimeGuard 自动打卡", f"{task.title}\n{message}", timeout=10)
+            except Exception:  # noqa: BLE001 - 通知失败不影响打卡本身
+                log.debug("自动打卡通知发送失败", exc_info=True)
+        if fired:
+            # 打卡改变了"下一次提醒"（今天不再提醒）与列表状态，必须刷新
+            try:
+                self.task_panel.refresh()
+            except Exception:  # noqa: BLE001
+                log.debug("自动打卡后刷新列表失败", exc_info=True)
+            self.reschedule_recurring(reason="auto-check-in")
+
     def _tick_ui(self) -> None:
         """主线程定时刷新：状态、明细表、待办倒计时、弹窗队列、托盘动作。"""
         if self._shutting_down:
@@ -640,6 +712,7 @@ class MainWindow:
             # 待办倒计时每秒刷新（只在待办页可见时做，省 CPU）
             if self._tasks_tab_visible():
                 self.task_panel.tick()
+            self._auto_check_in_pass()
             self.popup_manager.pump()
             self._drain_tray_actions()
         except Exception:  # noqa: BLE001 - 界面刷新异常不应导致程序退出

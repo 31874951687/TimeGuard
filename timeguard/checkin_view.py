@@ -399,7 +399,7 @@ class CumulativeDetail(ttk.Frame):
     UNDO_BG = "#2f3a52"
 
     def __init__(self, master: tk.Misc, font_family: str = "Microsoft YaHei UI",
-                 on_check_in=None, on_undo=None, **kwargs) -> None:
+                 on_check_in=None, on_undo=None, on_backfill=None, **kwargs) -> None:
         kwargs.setdefault("style", STYLE_CARD)
         kwargs.setdefault("padding", (10, 3))
         super().__init__(master, **kwargs)
@@ -411,6 +411,8 @@ class CumulativeDetail(ttk.Frame):
         self.on_check_in = on_check_in
         #: ``on_undo(task_id) -> (bool, str)``
         self.on_undo = on_undo
+        #: ``on_backfill(task_id) -> (bool, str)``：打开"补签"对话框（真正的取日期在调用方）
+        self.on_backfill = on_backfill
         #: 当前展示的任务（``timeguard.database.Task``）
         self.task = None
         #: 当前展示的状态（``timeguard.recurrence.CumulativeStatus``）
@@ -460,7 +462,14 @@ class CumulativeDetail(ttk.Frame):
                                      activeforeground="#ffffff", disabledforeground=SUB,
                                      relief="flat", bd=0, highlightthickness=0, cursor="hand2",
                                      font=(self.font_family, 9), padx=10, pady=3)
-        self.undo_button.pack(side="left")
+        self.undo_button.pack(side="left", padx=(0, 6))
+        # 补签：只能补"任务创建之后、今天之前"的日子（约束在数据层，见 UsageStore.check_in）
+        self.backfill_button = tk.Button(buttons, text="📝 补签…", command=self._backfill,
+                                         bg=self.UNDO_BG, fg=FG, activebackground="#3a4763",
+                                         activeforeground="#ffffff", disabledforeground=SUB,
+                                         relief="flat", bd=0, highlightthickness=0, cursor="hand2",
+                                         font=(self.font_family, 9), padx=10, pady=3)
+        self.backfill_button.pack(side="left")
 
     # ------------------------------------------------------------------ 对外
     def show_task(self, task, status) -> None:
@@ -528,12 +537,23 @@ class CumulativeDetail(ttk.Frame):
 
     @staticmethod
     def _plan_text(task) -> str:
-        """任务的一句话说明（累计打卡任务用它自带的 ``checkin_schedule_text()``）。"""
-        build = getattr(getattr(task, "rule", None), "checkin_schedule_text", None)
+        """任务的一句话说明（累计打卡任务用它自带的 ``checkin_schedule_text()``）。
+
+        开了"监控时长达标自动打卡"的话，把那条规则也接在后面 —— 任务列表的列宽放不下，
+        但详情面板这一行有地方，用户需要在这里确认"到底监控哪个对象、多少分钟"。
+        """
+        rule = getattr(task, "rule", None)
+        build = getattr(rule, "checkin_schedule_text", None)
         if not callable(build):
             return ""
         try:
-            return str(build())
+            text = str(build())
+            auto = getattr(rule, "auto_checkin_text", None)
+            if callable(auto):
+                extra = str(auto())
+                if extra:
+                    text = f"{text}　·　{extra}"
+            return text
         except Exception:  # noqa: BLE001 - 说明文字拿不到不该影响面板显示
             log.debug("生成任务说明失败", exc_info=True)
             return ""
@@ -599,6 +619,14 @@ class CumulativeDetail(ttk.Frame):
         """「撤销今日打卡」：转发给调用方注入的回调。"""
         self._run_action(self.on_undo, self.undo_button)
 
+    def _backfill(self) -> None:
+        """「📝 补签…」：交给调用方弹对话框选日期。
+
+        补签的合法性（不能补未来、不能补任务创建之前、同一天只能一次）由
+        :meth:`~timeguard.database.UsageStore.check_in` 判定，这里只负责转发与显示结果。
+        """
+        self._run_action(self.on_backfill, self.backfill_button)
+
     def _run_action(self, callback, source: tk.Button) -> None:
         """调回调并把返回的那句话显示出来；成功后按"保守方向"拨按钮。
 
@@ -625,6 +653,9 @@ class CumulativeDetail(ttk.Frame):
             self._set_enabled(self.check_button, False, ACCENT)
             # 刚打完卡，撤销是合法操作
             self._set_enabled(self.undo_button, True, self.UNDO_BG)
+        elif source is self.backfill_button:
+            # 补签不改"今天"的状态：两个按钮维持原样，等下一次 show_task 复位
+            pass
         else:
             self._set_enabled(self.undo_button, False, self.UNDO_BG)
             status = self.status

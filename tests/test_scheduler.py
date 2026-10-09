@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 
 os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_sched_test_")
@@ -107,10 +107,18 @@ def _make_scheduler(store, settings=None, now=None, on_batch=None):
 # ================================================================ 纯函数：累计打卡任务
 def _cumulative(store, title: str = "年末前完成 60 次两公里跑", target: int = 60,
                 deadline: str = "2026-12-31", remind: str = "18:00") -> int:
-    """建一条累计打卡任务（固定日期用，跟 _recurring 一样绕开自动生效日）。"""
+    """建一条累计打卡任务（固定日期用，跟 _recurring 一样绕开自动生效日）。
+
+    顺便把创建时间往前挪：``check_in`` 会拒绝"早于任务创建日期"的补签
+    （那是真实约束），而这些用例要造历史打卡记录，任务必须"早就建好了"。
+    """
     task_id = store.add_task(title, task_type=R.TYPE_CUMULATIVE, target_count=target,
                              deadline=deadline, remind_time=remind)
     assert task_id is not None
+    stamp = (datetime.now() - timedelta(days=400)).strftime("%Y-%m-%d %H:%M:%S")
+    store._conn.execute("UPDATE tasks SET created_at = ? WHERE id = ?",  # noqa: SLF001
+                        (stamp, task_id))
+    store._conn.commit()                                                  # noqa: SLF001
     return task_id
 
 
@@ -142,9 +150,10 @@ def test_cumulative_fires_at_remind_time() -> None:
     """到点派发一条"该打卡了"，并带上进度文案。"""
     store = _store()
     _cumulative(store)
-    for offset in (1, 2):                       # 先打两次卡
+    today = date.today()
+    for offset in (1, 2):                       # 先打两次卡（只能是过去的日子）
         assert store.check_in(store.cumulative_tasks()[0].id,
-                              date(2026, 11, 20) - timedelta(days=offset))[0]
+                              today - timedelta(days=offset))[0]
     state = _sched(store, _at(2026, 11, 20, 18, 0))
     assert state.batch is not None and state.batch.count == 1
     item = state.batch.items[0]
@@ -163,7 +172,7 @@ def test_cumulative_reminder_stops_once_target_reached() -> None:
     store = _store()
     task_id = _cumulative(store, target=3, deadline="2026-12-31")
     for offset in range(3):
-        assert store.check_in(task_id, date(2026, 11, 18) + timedelta(days=offset))[0]
+        assert store.check_in(task_id, date.today() - timedelta(days=3 - offset))[0]
     state = _sched(store, _at(2026, 11, 20, 18, 0))
     assert state.batch is None, "达标后还在提醒 = 骚扰"
     assert state.wakeup_at is None
@@ -198,10 +207,11 @@ def test_cumulative_already_checked_in_today_skips_to_tomorrow() -> None:
     """今天已经打过卡 → 今天不再提醒。"""
     store = _store()
     task_id = _cumulative(store)
-    assert store.check_in(task_id, date(2026, 11, 20))[0] is True
-    state = _sched(store, _at(2026, 11, 20, 18, 30))
+    today = date.today()
+    assert store.check_in(task_id, today)[0] is True
+    state = _sched(store, datetime.combine(today, time(18, 30)))
     assert state.batch is None
-    assert state.wakeup_at == _at(2026, 11, 21, 18, 0)
+    assert state.wakeup_at == datetime.combine(today + timedelta(days=1), time(18, 0))
     store.close()
 
 
@@ -275,7 +285,7 @@ def test_scheduler_upcoming_includes_cumulative() -> None:
     # 打满目标后不再出现在预览里
     task_id = task.id
     for offset in range(60):
-        assert store.check_in(task_id, date(2026, 8, 1) + timedelta(days=offset))[0]
+        assert store.check_in(task_id, date.today() - timedelta(days=60 - offset))[0]
     assert scheduler.upcoming() == []
     store.close()
 
