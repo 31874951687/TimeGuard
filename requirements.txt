@@ -1,0 +1,24 @@
+# TimeGuard 运行依赖
+# 安装：pip install -r requirements.txt
+#
+# 说明：以下库在 Windows 上均有官方预编译 wheel，直接 pip 安装即可，无需编译器。
+
+# 进程识别与 CPU/内存信息（必需）
+psutil>=5.9.6
+
+# 读取前台窗口标题、进程路径、DPI（必需；若安装失败程序会自动退回 ctypes 实现）
+pywin32>=306
+
+# 系统托盘图标（必需）
+pystray>=0.19.5
+Pillow>=10.0.0
+
+# Windows 右下角系统通知（推荐；缺失时自动退回 PowerShell 气泡通知）
+plyer>=2.1.0
+
+# 7 天使用时长 / 任务完成情况柱状图（推荐；缺失时统计页降级为文字提示）
+matplotlib>=3.8.0
+
+# 待办任务的日历式日期选择器（推荐；缺失时自动降级为内置“年/月/日”下拉选择器）
+# 安装它会一并装上 babel（用于中文日历显示）
+tkcalendar>=1.6.1

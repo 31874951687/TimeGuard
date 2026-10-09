@@ -1,0 +1,28 @@
+# 统一换行符：仓库里统一存 LF，检出时按下面的规则还原成 Windows 该有的样子。
+#
+# 为什么不能一刀切：
+#   * packaging/installer.bat 必须是 CRLF —— cmd 解析与 build_installer.ps1 都依赖它；
+#   * packaging/*.ps1 必须是 UTF-8 **带 BOM** —— 否则 PowerShell 5.1 读中文会乱码；
+# 这两点在 README「打包必须知道的三个坑」里都写过，别让 git 悄悄改掉。
+# （BOM 属于文件内容，git 不会动它；这里只管换行符。）
+* text=auto
+*.py   text
+*.md   text
+*.txt  text
+*.json text
+*.yml  text
+*.yaml text
+
+# Windows 原生脚本：检出为 CRLF
+*.bat  text eol=crlf
+*.cmd  text eol=crlf
+*.ps1  text eol=crlf
+
+# 二进制：不做换行符转换，也不试图 diff
+*.png  binary
+*.ico  binary
+*.jpg  binary
+*.jpeg binary
+*.exe  binary
+*.zip  binary
+*.7z   binary

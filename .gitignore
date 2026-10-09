@@ -1,0 +1,31 @@
+# 开发期临时文件（截图、缓存），不纳入版本管理
+tools/_shots/
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec.bak
+
+# 打包产物：几十 MB，不进仓库；要发就发 GitHub Release
+TimeGuard-Setup.exe
+*.zip
+*.7z
+*.exe
+
+# 本机专用的调试用打包配置（里面写死了绝对路径，别人拿去也用不了）
+TGCmd.spec
+TGProbe.spec
+TimeGuardDbg.spec
+
+# 早期遗留的空文件（放在仓库根上会让人以为根目录是个 Python 包）
+/__init__.py
+
+# 工具缓存
+.ruff_cache/
+.pytest_cache/
+.mypy_cache/
+
+# 运行期数据（真实使用记录 / 配置 / 日志，绝不入库）
+usage.db
+config.json
+timeguard.log
