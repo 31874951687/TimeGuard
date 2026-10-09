@@ -39,9 +39,10 @@ from .recurrence import DEFAULT_LATE_CATCHUP_MINUTES
 
 log = logging.getLogger(__name__)
 
-#: 提醒类型：正常提前 / 迟到补发
+#: 提醒类型：正常提前 / 迟到补发 / 累计打卡（该打卡了）
 KIND_ADVANCE = "advance"
 KIND_LATE = "late"
+KIND_CHECKIN = "checkin"
 
 #: 定时器最短与最长睡眠（毫秒）
 MIN_SLEEP_MS = 1000
@@ -50,13 +51,22 @@ MAX_SLEEP_MS = 24 * 60 * 60 * 1000
 
 @dataclass(frozen=True)
 class ReminderItem:
-    """一条"该提醒了"的待办事项。"""
+    """一条"该提醒了"的待办事项。
+
+    两种形态：
+
+    * **周期任务**：``occur`` 是一次发生（有时间窗），提醒在 ``start - remind_before``；
+    * **累计打卡任务**：没有时间窗，``occur`` 为 ``None``，只有一个"每天的提醒时刻"，
+      文案走 :attr:`detail_text`（已打卡 X/Y 次 · 还差 Z 次 · 还剩 N 天）。
+    """
 
     task: Task
-    occur: object                      # recurrence.Occurrence
+    occur: object | None               # recurrence.Occurrence（累计打卡任务为 None）
     remind_at: datetime                # 本该提醒的时刻
-    kind: str                          # advance / late
+    kind: str                          # advance / late / checkin
     overdue_minutes: int = 0           # 迟到补发时：已经过了多少分钟
+    occur_date: str = ""               # 去重键 'YYYY-MM-DD'（写 task_logs 用）
+    done_count: int = 0                # 累计打卡任务：已打卡次数（提醒时点的快照）
 
     @property
     def title(self) -> str:
@@ -67,12 +77,42 @@ class ReminderItem:
         return self.kind == KIND_LATE
 
     @property
+    def is_cumulative(self) -> bool:
+        return self.task.is_cumulative
+
+    @property
+    def key_date(self) -> str:
+        """写库用的日期键（周期任务取发生日期，累计打卡取今天）。"""
+        if self.occur_date:
+            return self.occur_date
+        return getattr(self.occur, "date_str", "") or self.remind_at.strftime("%Y-%m-%d")
+
+    @property
     def window_text(self) -> str:
-        """``'18:00~20:00'``。"""
+        """``'18:00~20:00'``（累计打卡任务没有窗口，给提醒时间）。"""
+        if self.occur is None:
+            return f"每天 {self.remind_at:%H:%M} 提醒"
         return f"{self.occur.start:%H:%M}~{self.occur.end:%H:%M}"
 
     @property
+    def detail_text(self) -> str:
+        """弹窗/通知里那行说明。累计打卡任务把进度和剩余天数说清楚。"""
+        if not self.is_cumulative:
+            return f"{self.window_text}　{self.kind_label}"
+        rule = self.task.rule
+        target = max(1, int(rule.target_count or 1))
+        remaining = max(0, target - self.done_count)
+        text = f"已打卡 {self.done_count}/{target} 次 · 还差 {remaining} 次"
+        if rule.deadline is not None:
+            days = (rule.deadline - self.remind_at.date()).days
+            tail = "今天是最后一天" if days == 0 else f"还剩 {days} 天"
+            text += f" · 截止 {rule.deadline:%m-%d}（{tail}）"
+        return f"{text}　{self.kind_label}"
+
+    @property
     def kind_label(self) -> str:
+        if self.kind == KIND_CHECKIN:
+            return "该打卡了"
         if self.kind == KIND_LATE:
             return f"迟到提醒（已过 {self.overdue_minutes} 分钟）"
         return "即将开始"
@@ -100,7 +140,12 @@ class ReminderBatch:
     def headline(self) -> str:
         """弹窗标题用的一句话。"""
         if self.count == 1:
-            return f"即将开始：{self.items[0].title}"
+            item = self.items[0]
+            if item.is_cumulative:
+                return f"该打卡了：{item.title}"
+            return f"即将开始：{item.title}"
+        if all(item.is_cumulative for item in self.items):
+            return f"{self.count} 项任务今天还没打卡"
         return f"{self.count} 项任务即将开始"
 
     def summary_lines(self) -> list[str]:
@@ -108,13 +153,15 @@ class ReminderBatch:
         lines = []
         for index, item in enumerate(self.items, 1):
             prefix = f"{index}. " if self.count > 1 else ""
-            lines.append(f"{prefix}{item.title}　{item.window_text}　{item.kind_label}")
+            lines.append(f"{prefix}{item.title}　{item.detail_text}")
         return lines
 
     def notify_text(self) -> str:
         """系统通知正文（合并成一条）。"""
         if self.count == 1:
             item = self.items[0]
+            if item.is_cumulative:
+                return f"{item.title}　还差 {item.detail_text.split('·')[1].strip()}"
             return f"{item.title}　{item.window_text}"
         head = "\n".join(f"{i}. {item.title}" for i, item in enumerate(self.items[:5], 1))
         if self.count > 5:
@@ -142,26 +189,79 @@ def compute_schedule(tasks: list[Task],
                      logs: dict[tuple[int, str], TaskLog],
                      now: datetime,
                      catchup_minutes: int = DEFAULT_LATE_CATCHUP_MINUTES,
-                     catchup_enabled: bool = True) -> ScheduleState:
+                     catchup_enabled: bool = True,
+                     checkin_counts: dict[int, int] | None = None,
+                     checked_today: set[int] | None = None) -> ScheduleState:
     """纯函数：算出"此刻该派发的提醒"与"下一次唤醒时刻"。
 
-    :param tasks: 候选任务（周期任务；单次任务由原有的临近截止通知负责）
+    :param tasks: 候选任务（周期任务 + 累计打卡任务；单次任务由临近截止通知负责）
     :param logs: ``{(task_id, occur_date): TaskLog}``，用于判断是否已提醒过
     :param now: 当前时刻（注入以便测试）
     :param catchup_minutes: 迟到补发窗口（分钟）
     :param catchup_enabled: 是否启用迟到补发
+    :param checkin_counts: ``{task_id: 已打卡次数}``（累计打卡任务用）
+    :param checked_today: 今天已经打过卡的任务 id 集合
 
-    实现要点（容易踩坑）：判定**不能**只看"当前那一次发生"。
-    当 ``remind_before`` 很大时（例如 1440 分钟），下一次发生的提醒时刻会落在
-    **当前这次发生结束之前**，那时"当前这次"已经提醒过、于是被跳过，
-    而下一这次又不在"当前"锚点上 —— 结果提醒被推迟到上个窗口结束（实测晚 2 小时）。
-    所以这里统一改成：**从 now 起向后扫描若干次发生，谁进入窗口就派发谁**。
+    累计打卡任务的规则（与用户的 5 条避坑一一对应）：
+
+    * **达标即停**（避坑 #1）：``已打卡 >= 目标`` 直接跳过，不再排任何定时器；
+    * **过期即停**（避坑 #5）：``今天 > 截止日`` 也跳过（任务已经结束，提醒只是噪音）；
+    * **今天已打卡**：不再提醒今天，下一次顺延到明天；
+    * **一个自然日最多提醒一次**：靠 ``task_logs(task_id, 今天).remind_at`` 去重（避坑 #2）；
+    * 提醒时刻已经过去且在补发窗口内 → 迟到提醒；超出窗口 → 今天不再打扰，
+      直接把定时器排到明天。
     """
     due: list[ReminderItem] = []
     future: list[datetime] = []
     catchup = timedelta(minutes=max(0, int(catchup_minutes)))
+    counts = checkin_counts or {}
+    done_today = checked_today or set()
 
     for task in tasks:
+        if task.is_cumulative:
+            rule = task.rule
+            target = max(1, int(rule.target_count or 1))
+            total = int(counts.get(task.id, 0))
+            today = now.date()
+            today_key = today.strftime("%Y-%m-%d")
+
+            if total >= target or rule.is_expired(today):
+                continue                       # 达标 / 已过期：彻底不再提醒
+            if rule.deadline is None:
+                continue                       # 没有截止日期的脏数据，不参与提醒
+
+            logged = logs.get((task.id, today_key))
+            if logged is not None and logged.remind_at:
+                # 今天已经提醒过了：把定时器排到明天（不再重复打扰）
+                nxt = rule.next_checkin_reminder(now, day_done=True)
+                if nxt is not None:
+                    future.append(nxt)
+                continue
+
+            moment = rule.checkin_reminder_on(today)
+            if moment > now:
+                future.append(moment)          # 还没到点
+                continue
+
+            if task.id in done_today:
+                nxt = rule.next_checkin_reminder(now, day_done=True)
+                if nxt is not None:
+                    future.append(nxt)
+                continue
+
+            if catchup_enabled and now <= moment + catchup:
+                overdue = max(0, int((now - moment).total_seconds() // 60))
+                due.append(ReminderItem(task, None, moment,
+                                        KIND_LATE if overdue else KIND_CHECKIN, overdue,
+                                        occur_date=today_key, done_count=total))
+            else:
+                # 错过太多（例如 18:00 的提醒，21:00 才开机）→ 今天不再打扰，
+                # 但列表里那条"今日未打卡"仍然看得见；定时器排到明天。
+                nxt = rule.next_checkin_reminder(now, day_done=True)
+                if nxt is not None:
+                    future.append(nxt)
+            continue
+
         if not task.is_recurring:
             continue
 
@@ -277,8 +377,9 @@ class TaskScheduler:
         """读取候选任务与"今天 ±1 天"的发生记录。
 
         只取近几天的记录，避免把历史全表读进来（周期任务的表会一直增长）。
+        候选任务含**累计打卡任务**：它们用同一套 task_logs 去重、同一个弹窗合并派发。
         """
-        tasks = self.store.recurring_tasks()
+        tasks = self.store.recurring_tasks() + self.store.cumulative_tasks()
         if not tasks:
             return [], {}
         today = self._now().date()
@@ -288,15 +389,22 @@ class TaskScheduler:
                 logs[(log_row.task_id, log_row.occur_date)] = log_row
         return tasks, logs
 
+    def _load_checkins(self) -> tuple[dict[int, int], set[int]]:
+        """累计打卡任务的次数与"今天已打卡"集合（两次批量查询，不做 N+1）。"""
+        return self.store.checkin_counts(), self.store.checkin_ids_on(self._now().date())
+
     def state(self, now: datetime | None = None) -> ScheduleState:
         """算一次调度状态（不派发、不排程）。"""
         moment = now or self._now()
         tasks, logs = self._load()
+        counts, checked = self._load_checkins()
         return compute_schedule(
             tasks, logs, moment,
             catchup_minutes=int(getattr(self.settings, "recurring_catchup_minutes",
                                         DEFAULT_LATE_CATCHUP_MINUTES)),
             catchup_enabled=bool(getattr(self.settings, "recurring_late_catchup", True)),
+            checkin_counts=counts,
+            checked_today=checked,
         )
 
     def next_wakeup_in(self) -> int | None:
@@ -338,16 +446,19 @@ class TaskScheduler:
             # 否则 wakeup 会停在"这批本身"（已到点）上 → 定时器不武装。
             # 这里只做**虚拟标记**，不写库、不回调（真正的派发由 collect_due+dispatch 完成）。
             tasks, logs = self._load()
+            counts, checked = self._load_checkins()
             virtual = dict(logs)
             for item in state.batch.items:
-                virtual[(item.task.id, item.occur.date_str)] = TaskLog(
-                    id=0, task_id=item.task.id, occur_date=item.occur.date_str,
+                virtual[(item.task.id, item.key_date)] = TaskLog(
+                    id=0, task_id=item.task.id, occur_date=item.key_date,
                     remind_at=state.batch.fired_at, remind_kind=item.kind)
             state = compute_schedule(
                 tasks, virtual, self._now(),
                 catchup_minutes=int(getattr(self.settings, "recurring_catchup_minutes",
                                             DEFAULT_LATE_CATCHUP_MINUTES)),
                 catchup_enabled=bool(getattr(self.settings, "recurring_late_catchup", True)),
+                checkin_counts=counts,
+                checked_today=checked,
             )
 
         if state.wakeup_at is None:
@@ -390,7 +501,7 @@ class TaskScheduler:
         self._fired_count += 1
         marked = 0
         for item in batch.items:
-            if self.store.log_occurrence(item.task.id, item.occur.date_str,
+            if self.store.log_occurrence(item.task.id, item.key_date,
                                          remind_at=batch.fired_at, remind_kind=item.kind):
                 marked += 1
         if marked != len(batch.items):
@@ -454,8 +565,17 @@ class TaskScheduler:
         """列出接下来几次提醒（用于界面预览，最多每个任务 2 次）。"""
         now = self._now()
         tasks, logs = self._load()
+        counts, checked = self._load_checkins()
         result: list[tuple[Task, datetime]] = []
         for task in tasks:
+            if task.is_cumulative:
+                target = max(1, int(task.rule.target_count or 1))
+                finished = int(counts.get(task.id, 0)) >= target
+                moment = task.rule.next_checkin_reminder(
+                    now, day_done=task.id in checked, finished=finished)
+                if moment is not None:
+                    result.append((task, moment))
+                continue
             probe = now
             found = 0
             for _ in range(24):

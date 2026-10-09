@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import sys
 import tempfile
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="timeguard_sched_test_")
@@ -23,6 +23,7 @@ from timeguard.utils import use_utf8_console  # noqa: E402
 from timeguard.database import UsageStore  # noqa: E402
 from timeguard.scheduler import (  # noqa: E402
     KIND_ADVANCE,
+    KIND_CHECKIN,
     KIND_LATE,
     TaskScheduler,
     compute_schedule,
@@ -101,6 +102,182 @@ def _make_scheduler(store, settings=None, now=None, on_batch=None):
     scheduler._test_root = root             # noqa: SLF001
     scheduler._test_batches = batches       # noqa: SLF001
     return scheduler
+
+
+# ================================================================ 纯函数：累计打卡任务
+def _cumulative(store, title: str = "年末前完成 60 次两公里跑", target: int = 60,
+                deadline: str = "2026-12-31", remind: str = "18:00") -> int:
+    """建一条累计打卡任务（固定日期用，跟 _recurring 一样绕开自动生效日）。"""
+    task_id = store.add_task(title, task_type=R.TYPE_CUMULATIVE, target_count=target,
+                             deadline=deadline, remind_time=remind)
+    assert task_id is not None
+    return task_id
+
+
+def _sched(store, now, **kwargs):
+    """用给定时刻算一次调度（把累计打卡任务的次数也一并读出来）。"""
+    tasks = store.recurring_tasks() + store.cumulative_tasks()
+    logs = {}
+    for offset in (-1, 0, 1):
+        day = (now + timedelta(days=offset)).date()
+        for log_row in store.task_logs_on(day):
+            logs[(log_row.task_id, log_row.occur_date)] = log_row
+    return compute_schedule(tasks, logs, now,
+                            checkin_counts=store.checkin_counts(),
+                            checked_today=store.checkin_ids_on(now.date()),
+                            **kwargs)
+
+
+def test_cumulative_waits_until_remind_time() -> None:
+    """18:00 提醒：17:59 不打扰，但定时器要排到 18:00。"""
+    store = _store()
+    _cumulative(store)
+    state = _sched(store, _at(2026, 11, 20, 17, 59))
+    assert state.batch is None
+    assert state.wakeup_at == _at(2026, 11, 20, 18, 0)
+    store.close()
+
+
+def test_cumulative_fires_at_remind_time() -> None:
+    """到点派发一条"该打卡了"，并带上进度文案。"""
+    store = _store()
+    _cumulative(store)
+    for offset in (1, 2):                       # 先打两次卡
+        assert store.check_in(store.cumulative_tasks()[0].id,
+                              date(2026, 11, 20) - timedelta(days=offset))[0]
+    state = _sched(store, _at(2026, 11, 20, 18, 0))
+    assert state.batch is not None and state.batch.count == 1
+    item = state.batch.items[0]
+    assert item.kind == KIND_CHECKIN
+    assert item.is_cumulative and item.occur is None
+    assert item.kind_label == "该打卡了"
+    assert item.done_count == 2
+    assert "已打卡 2/60 次" in item.detail_text and "还差 58 次" in item.detail_text
+    assert "还剩 41 天" in item.detail_text
+    assert state.batch.headline() == "该打卡了：年末前完成 60 次两公里跑"
+    store.close()
+
+
+def test_cumulative_reminder_stops_once_target_reached() -> None:
+    """避坑 #1：达标之后**不再有任何提醒**（连定时器都不排）。"""
+    store = _store()
+    task_id = _cumulative(store, target=3, deadline="2026-12-31")
+    for offset in range(3):
+        assert store.check_in(task_id, date(2026, 11, 18) + timedelta(days=offset))[0]
+    state = _sched(store, _at(2026, 11, 20, 18, 0))
+    assert state.batch is None, "达标后还在提醒 = 骚扰"
+    assert state.wakeup_at is None
+    assert state.has_work is False
+    store.close()
+
+
+def test_cumulative_reminder_stops_after_deadline() -> None:
+    """过了截止日也不再提醒（任务已结束）。"""
+    store = _store()
+    _cumulative(store, target=60, deadline="2026-11-19")
+    assert _sched(store, _at(2026, 11, 19, 18, 0)).batch is not None      # 最后一天还能提醒
+    after = _sched(store, _at(2026, 11, 20, 18, 0))
+    assert after.batch is None and after.wakeup_at is None
+    store.close()
+
+
+def test_cumulative_not_reminded_again_today() -> None:
+    """同一天只提醒一次：已经提醒过 → 今天不再弹，定时器排到明天。"""
+    store = _store()
+    task_id = _cumulative(store)
+    assert store.log_occurrence(task_id, date(2026, 11, 20),
+                                remind_at=_at(2026, 11, 20, 18, 0),
+                                remind_kind=KIND_CHECKIN) is True
+    state = _sched(store, _at(2026, 11, 20, 19, 30))
+    assert state.batch is None
+    assert state.wakeup_at == _at(2026, 11, 21, 18, 0)
+    store.close()
+
+
+def test_cumulative_already_checked_in_today_skips_to_tomorrow() -> None:
+    """今天已经打过卡 → 今天不再提醒。"""
+    store = _store()
+    task_id = _cumulative(store)
+    assert store.check_in(task_id, date(2026, 11, 20))[0] is True
+    state = _sched(store, _at(2026, 11, 20, 18, 30))
+    assert state.batch is None
+    assert state.wakeup_at == _at(2026, 11, 21, 18, 0)
+    store.close()
+
+
+def test_cumulative_late_catchup_within_window() -> None:
+    """刚错过几分钟（开机补发窗口内）→ 补一条"迟到提醒"。"""
+    store = _store()
+    _cumulative(store)
+    state = _sched(store, _at(2026, 11, 20, 18, 3), catchup_minutes=5)
+    assert state.batch is not None and state.batch.count == 1
+    item = state.batch.items[0]
+    assert item.kind == KIND_LATE and item.overdue_minutes == 3
+    assert "迟到提醒" in item.kind_label
+
+
+def test_cumulative_missed_long_ago_does_not_nag() -> None:
+    """错过太久（18:00 的提醒，21:00 才开机）→ 今天不再打扰，直接排到明天。"""
+    store = _store()
+    _cumulative(store)
+    state = _sched(store, _at(2026, 11, 20, 21, 0), catchup_minutes=5)
+    assert state.batch is None
+    assert state.wakeup_at == _at(2026, 11, 21, 18, 0)
+    store.close()
+
+
+def test_cumulative_and_periodic_merge_into_one_batch() -> None:
+    """核心交互不变量：同一刻到点的周期任务与打卡任务**只弹一个窗**。"""
+    store = _store()
+    _recurring(store, "跑步", task_type=R.TYPE_DAILY, time_start="18:00", time_end="20:00",
+               remind_before_minutes=0)
+    _cumulative(store, remind="18:00")
+    state = _sched(store, _at(2026, 11, 20, 18, 0))
+    assert state.batch is not None and state.batch.count == 2, state.batch
+    kinds = {item.kind for item in state.batch.items}
+    assert kinds == {KIND_ADVANCE, KIND_CHECKIN}
+    assert state.batch.headline() == "2 项任务即将开始"     # 混合批次用中性标题
+    lines = state.batch.summary_lines()
+    assert any("该打卡了" in line for line in lines)
+    assert any("即将开始" in line for line in lines)
+    store.close()
+
+
+def test_scheduler_dispatch_marks_and_does_not_repeat() -> None:
+    """通过 TaskScheduler 走完整流程：派发 → 写 task_logs → 不再重复提醒。"""
+    store = _store()
+    _cumulative(store, target=60, deadline="2026-12-31")
+    scheduler = _make_scheduler(store, now=_at(2026, 11, 20, 18, 0))
+    scheduler.start()
+    assert len(scheduler._test_batches) == 1                # noqa: SLF001
+    batch = scheduler._test_batches[0]                      # noqa: SLF001
+    assert batch.items[0].kind == KIND_CHECKIN
+    log_row = store.get_task_log(batch.items[0].task.id, date(2026, 11, 20))
+    assert log_row is not None and log_row.remind_at is not None
+    assert log_row.remind_kind == KIND_CHECKIN
+    # 同一时刻再算一次：不该重复提醒，而是排到明天
+    scheduler._test_clock["now"] = _at(2026, 11, 20, 18, 30)  # noqa: SLF001
+    state = scheduler.state()
+    assert state.batch is None
+    assert state.wakeup_at == _at(2026, 11, 21, 18, 0)
+    store.close()
+
+
+def test_scheduler_upcoming_includes_cumulative() -> None:
+    """下一次提醒预览也要包含累计打卡任务（界面用）。"""
+    store = _store()
+    _cumulative(store)
+    scheduler = _make_scheduler(store, now=_at(2026, 11, 20, 9, 0))
+    upcoming = scheduler.upcoming()
+    assert len(upcoming) == 1
+    task, moment = upcoming[0]
+    assert task.is_cumulative and moment == _at(2026, 11, 20, 18, 0)
+    # 打满目标后不再出现在预览里
+    task_id = task.id
+    for offset in range(60):
+        assert store.check_in(task_id, date(2026, 8, 1) + timedelta(days=offset))[0]
+    assert scheduler.upcoming() == []
+    store.close()
 
 
 # ================================================================ 纯函数：提前提醒

@@ -17,7 +17,7 @@ from __future__ import annotations
 import calendar
 import logging
 import tkinter as tk
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from tkinter import ttk
 
 log = logging.getLogger(__name__)
@@ -230,6 +230,7 @@ class DateTimePicker(ttk.Frame):
         _style_time_combobox(self)
         time_box = ttk.Frame(self, style=f"{self.style_prefix}.TFrame")
         time_box.pack(side="left")
+        self.time_box = time_box          # 供"只要日期"的子类隐藏（见 DatePicker）
         self.hour_var = tk.StringVar(value=f"{self._value.hour:02d}")
         self.minute_var = tk.StringVar(value=f"{self._value.minute:02d}")
         self.hour_box = ttk.Combobox(
@@ -463,3 +464,45 @@ _has_chinese_locale = has_chinese_locale
 def backend_name() -> str:
     """当前使用的日期选择实现（界面提示用）。"""
     return "tkcalendar 日历" if HAS_TKCALENDAR else "内置下拉选择器（未安装 tkcalendar）"
+
+
+class DatePicker(DateTimePicker):
+    """**只选日期**的变体（累计打卡任务的"最终截止日期"用它）。
+
+    直接复用已经验证过的 :class:`DateTimePicker`（含 tkcalendar 降级方案），
+    只把时/分下拉与"无期限"按钮藏起来 —— 截止日期精确到天，
+    给它显示"时:分"会让人以为要卡点打卡，反而增加困惑。
+
+    对外只暴露 :meth:`get_date` / :meth:`set_date`（值统一取当天 00:00）。
+    """
+
+    def __init__(self, master: tk.Misc, **kwargs) -> None:
+        super().__init__(master, **kwargs)
+        for widget in (getattr(self, "time_box", None), getattr(self, "clear_button", None)):
+            if widget is not None:
+                try:
+                    widget.pack_forget()
+                except tk.TclError:      # pragma: no cover - 控件已销毁
+                    pass
+
+    def get_date(self) -> date | None:
+        """当前选择的日期（控件异常时返回 None）。"""
+        value = self.get()
+        return value.date() if value is not None else None
+
+    def set(self, value: datetime | date | None) -> None:      # type: ignore[override]
+        """设置日期（时间部分固定为 00:00）。
+
+        覆盖父类是为了容忍 ``date``：父类的 ``set`` 会调用 ``value.replace(second=0)``，
+        而 ``date`` 没有 ``second`` 参数，直接传进来会 TypeError（第一次接线时就踩到了）。
+        """
+        if value is None:
+            self.set_none()
+            return
+        if isinstance(value, datetime):
+            value = value.date()
+        super().set(datetime(value.year, value.month, value.day))
+
+    def set_date(self, value: date | datetime | None) -> None:
+        """设置日期（``set`` 的语义化别名）。"""
+        self.set(value)

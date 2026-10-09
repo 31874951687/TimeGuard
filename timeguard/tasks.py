@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import calendar
 import logging
 import tkinter as tk
 from dataclasses import dataclass
@@ -18,21 +19,30 @@ from tkinter import messagebox, ttk
 
 from . import phrases
 from .database import Task, TaskLog, UsageStore
-from .datepicker import DateTimePicker, backend_name, quick_datetime
+from .datepicker import DatePicker, DateTimePicker, backend_name, quick_datetime
 from .recurrence import (
     DEFAULT_END,
     DEFAULT_REMIND_BEFORE,
+    DEFAULT_REMIND_TIME,
     DEFAULT_START,
+    DEFAULT_TARGET_COUNT,
     MAX_REMIND_BEFORE,
+    MAX_TARGET_COUNT,
     MIN_REMIND_BEFORE,
+    STATE_DONE_DEADLINE as R_STATE_DONE_DEADLINE,
+    STATE_DONE_EARLY as R_STATE_DONE_EARLY,
+    STATE_MISSED as R_STATE_MISSED,
     TASK_TYPES,
+    TYPE_CUMULATIVE,
     TYPE_DAILY,
     TYPE_LABELS,
     TYPE_ONCE,
     TYPE_WEEKLY,
     WEEKDAY_CN,
+    CumulativeStatus,
     Occurrence,
     TaskRule,
+    cumulative_status,
     format_hhmm,
     format_iso_weekdays,
     parse_hhmm,
@@ -57,6 +67,33 @@ PURPLE = "#a78bfa"
 STATUS_PENDING = "○"
 STATUS_DONE = "✔"
 STATUS_OVERDUE = "!"
+
+
+def cumulative_row_texts(status: CumulativeStatus) -> tuple[str, str]:
+    """累计打卡任务在列表两列里的**紧凑**文案 ``(状态, 进度/剩余)``。
+
+    列表列宽有限（状态列约 90px、剩余列约 180px），所以这里刻意用短文案；
+    "还差 X 次 / 距截止还有几天"这类完整句子留给下方的提示条与打卡详情面板
+    （见 :meth:`TaskPanel._update_hint` 与 ``checkin_view.CumulativeDetail``）。
+    """
+    if status.state == R_STATE_DONE_EARLY:
+        state_text = f"{STATUS_DONE} 提前完成"
+    elif status.state == R_STATE_DONE_DEADLINE:
+        state_text = f"{STATUS_DONE} 压哨完成"
+    elif status.state == R_STATE_MISSED:
+        state_text = f"{STATUS_OVERDUE} 逾期未达标"
+    elif status.today_checked:
+        state_text = f"{STATUS_DONE} 已打卡"
+    else:
+        state_text = f"{STATUS_PENDING} 未打卡"
+    if status.finished:
+        return state_text, f"{status.total}/{status.target} · 已达成目标"
+    # 剩余列宽 170px，只放得下 ~22 个汉字：用"还差 15 · 剩 60 天"这种紧凑写法，
+    # 完整句子（"还差 15 次 · 还剩 60 天 · 截止 12-08"）留给提示条与详情面板。
+    left = status.countdown_text()
+    left = left.replace("还剩 ", "剩 ").replace("今天是最后一天", "最后一天")
+    left = left.replace("已过期 ", "已过 ").replace("无截止日期", "无期限")
+    return state_text, f"{status.total}/{status.target} · 还差 {status.remaining} · {left}"
 
 
 # ================================================================ 可拖拽分隔条
@@ -367,11 +404,20 @@ class TaskDraft:
     time_end: str = DEFAULT_END
     days_of_week: str = ""
     remind_before_minutes: int = DEFAULT_REMIND_BEFORE
+    #: 累计打卡任务：总目标次数 / 最终截止日期 / 每日提醒时间
+    target_count: int = DEFAULT_TARGET_COUNT
+    deadline: date | None = None
+    remind_time: str = DEFAULT_REMIND_TIME
 
     @property
     def is_recurring(self) -> bool:
         """是否周期任务（每天 / 每周）。"""
         return self.task_type in (TYPE_DAILY, TYPE_WEEKLY)
+
+    @property
+    def is_cumulative(self) -> bool:
+        """是否累计打卡任务。"""
+        return self.task_type == TYPE_CUMULATIVE
 
     @property
     def type_label(self) -> str:
@@ -384,11 +430,15 @@ class TaskDraft:
         if self.task_type == TYPE_WEEKLY:
             return TaskRule.weekly(self.days_of_week, self.time_start, self.time_end,
                                    self.remind_before_minutes)
+        if self.task_type == TYPE_CUMULATIVE:
+            return TaskRule.cumulative(self.target_count, self.deadline, self.remind_time)
         return TaskRule(TYPE_ONCE)
 
     def preview_text(self, now: datetime | None = None) -> str:
         """对话框里那行"这句话就是我要保存的东西"的预览。"""
         now = now or datetime.now()
+        if self.is_cumulative:
+            return self._cumulative_preview(now)
         if not self.is_recurring:
             if self.due_at is None:
                 return "单次任务 · 无期限 · 按「截止前 24 小时」提醒"
@@ -410,6 +460,33 @@ class TaskDraft:
             first_day = occurrence.day.strftime("%m-%d") if occurrence is not None else start[5:]
             text += f"　（今天的时间已过，从 {first_day} 开始）"
         return text
+
+    def _cumulative_preview(self, now: datetime) -> str:
+        """累计打卡任务的预览：把"什么时候提醒、什么时候截止、还差多少"说清楚。"""
+        target = max(1, int(self.target_count or 1))
+        parts = [f"累计打卡任务 · 目标 {target} 次"]
+        if self.deadline is None:
+            return "　".join(parts) + " · 还没选截止日期"
+        days = (self.deadline - now.date()).days
+        parts.append(f"截止 {self.deadline:%Y-%m-%d}")
+        if days < 0:
+            parts.append("⚠ 截止日期已经过去了")
+        elif days == 0:
+            parts.append("今天就是最后一天")
+        else:
+            parts.append(f"还剩 {days} 天")
+        rule = self.rule()
+        moment = rule.checkin_reminder_on(now.date())
+        next_moment = rule.next_checkin_reminder(now)
+        if next_moment is not None:
+            when = "今天" if next_moment.date() == now.date() else f"{next_moment:%m-%d}"
+            parts.append(f"每天 {format_hhmm(moment.time())} 提醒（下次 {when} "
+                         f"{next_moment:%H:%M}）")
+        else:
+            parts.append(f"每天 {self.remind_time} 提醒")
+        if days >= 0:
+            parts.append("截止日之前只显示「今日未打卡 / 还差 X 次」，不会算逾期")
+        return " · ".join(parts)
 
 
 # ================================================================ 任务编辑对话框
@@ -553,6 +630,51 @@ class TaskDialog(tk.Toplevel):
         ttk.Label(remind_row, text=f"分钟（{MIN_REMIND_BEFORE}~{MAX_REMIND_BEFORE}，开始前）",
                   style="CardHint.TLabel").pack(side="left", padx=(6, 0))
 
+        # ---- 分支三：累计打卡任务（目标次数 + 截止日期 + 每日提醒时间）----
+        self.cum_frame = ttk.Frame(body, style="Card.TFrame")
+        self.cum_frame.grid(row=4, column=0, sticky="ew", pady=(12, 0))
+
+        goal_row = ttk.Frame(self.cum_frame, style="Card.TFrame")
+        goal_row.grid(row=0, column=0, sticky="w")
+        ttk.Label(goal_row, text="总目标次数：", style="Card.TLabel").pack(side="left")
+        self.target_var = tk.StringVar(value=str(rule.target_count or DEFAULT_TARGET_COUNT))
+        self.target_entry = ttk.Entry(goal_row, textvariable=self.target_var, width=6,
+                                      font=self.font_body)
+        self.target_entry.pack(side="left")
+        self.target_entry.bind("<KeyRelease>", lambda _e: self._update_preview())
+        ttk.Label(goal_row, text="次　（例如 60 次＝年末前跑 60 个两公里）",
+                  style="CardHint.TLabel").pack(side="left", padx=(6, 0))
+
+        deadline_row = ttk.Frame(self.cum_frame, style="Card.TFrame")
+        deadline_row.grid(row=1, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(deadline_row, text="最终截止日期：", style="Card.TLabel").pack(side="left")
+        self.deadline_picker = DatePicker(deadline_row, font_family=self.font_family,
+                                          style_prefix="Card")
+        self.deadline_picker.pack(side="left", padx=(0, 4))
+        default_deadline = rule.deadline or (datetime.now().date() + timedelta(days=90))
+        self.deadline_picker.set(default_deadline)
+        quick_deadline = ttk.Frame(self.cum_frame, style="Card.TFrame")
+        quick_deadline.grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Label(quick_deadline, text="快捷：", style="CardHint.TLabel").pack(side="left")
+        for label, days_ahead in (("本月底", None), ("3 个月后", 90), ("半年后", 180), ("今年底", "yearend")):
+            ttk.Button(quick_deadline, text=label, style="Tiny.TButton",
+                       command=lambda d=days_ahead: self._set_deadline_quick(d)).pack(
+                side="left", padx=(0, 4))
+        ttk.Label(quick_deadline, text="　截止日当天 23:59 之前打卡都算数",
+                  style="CardHint.TLabel").pack(side="left")
+
+        remind_row2 = ttk.Frame(self.cum_frame, style="Card.TFrame")
+        remind_row2.grid(row=3, column=0, sticky="w", pady=(10, 0))
+        ttk.Label(remind_row2, text="每日提醒时间：", style="Card.TLabel").pack(side="left")
+        self.remind_time_field = TimeField(remind_row2, font_body=self.font_body,
+                                           value=rule.remind_time and format_hhmm(rule.remind_time)
+                                           or DEFAULT_REMIND_TIME,
+                                           on_change=self._update_preview)
+        self.remind_time_field.pack(side="left")
+        ttk.Label(remind_row2,
+                  text="　每天到点提醒一次「该打卡了」；达标或过了截止日就自动停止提醒",
+                  style="CardHint.TLabel").pack(side="left", padx=(8, 0))
+
         # ---- 预览 + 优先级 ----
         ttk.Label(body, textvariable=self.preview_var, style="CardHint.TLabel",
                   wraplength=620, justify="left").grid(row=5, column=0, sticky="w", pady=(12, 0))
@@ -589,9 +711,15 @@ class TaskDialog(tk.Toplevel):
         task_type = self._current_type()
         if task_type == TYPE_ONCE:
             self.recur_frame.grid_remove()
+            self.cum_frame.grid_remove()
             self.once_frame.grid()
+        elif task_type == TYPE_CUMULATIVE:
+            self.once_frame.grid_remove()
+            self.recur_frame.grid_remove()
+            self.cum_frame.grid()
         else:
             self.once_frame.grid_remove()
+            self.cum_frame.grid_remove()
             self.recur_frame.grid()
             if task_type == TYPE_DAILY:
                 self.days_frame.grid_remove()
@@ -600,6 +728,19 @@ class TaskDialog(tk.Toplevel):
                 if not any(var.get() for var in self.day_vars.values()):
                     # 首次切到"每周"：默认勾上今天，避免"一天都没选"被拦下
                     self.day_vars[datetime.now().isoweekday()].set(True)
+        self._update_preview()
+
+    def _set_deadline_quick(self, days_ahead) -> None:
+        """截止日期快捷按钮：本月底 / 3 个月后 / 半年后 / 今年底。"""
+        today = datetime.now().date()
+        if days_ahead == "yearend":
+            target = date(today.year, 12, 31)
+        elif days_ahead is None:                       # 本月底
+            last_day = calendar.monthrange(today.year, today.month)[1]
+            target = date(today.year, today.month, last_day)
+        else:
+            target = today + timedelta(days=int(days_ahead))
+        self.deadline_picker.set_date(target)
         self._update_preview()
 
     def _set_days(self, days) -> None:
@@ -628,12 +769,24 @@ class TaskDialog(tk.Toplevel):
             return None
         return value
 
+    def _parse_target(self) -> int | None:
+        """解析"总目标次数"（非法返回 ``None``）。"""
+        raw = self.target_var.get().strip()
+        try:
+            value = int(float(raw))
+        except ValueError:
+            return None
+        if value < 1 or value > MAX_TARGET_COUNT:
+            return None
+        return value
+
     def _draft(self) -> TaskDraft:
         """把界面上的值收集成草稿（不做阻断式校验）。"""
         remind = self._parse_remind()
         task_type = self._current_type()
         days = (format_iso_weekdays([iso for iso, var in self.day_vars.items() if var.get()])
                 if task_type == TYPE_WEEKLY else "")
+        target = self._parse_target()
         return TaskDraft(
             title=self.title_var.get().strip(),
             due_at=self.picker.get(),
@@ -643,6 +796,9 @@ class TaskDialog(tk.Toplevel):
             time_end=self.end_field.get_text(),
             days_of_week=days,
             remind_before_minutes=DEFAULT_REMIND_BEFORE if remind is None else remind,
+            target_count=DEFAULT_TARGET_COUNT if target is None else target,
+            deadline=self.deadline_picker.get_date(),
+            remind_time=self.remind_time_field.get_text(),
         )
 
     # ------------------------------------------------------------------ 位置 / 结果
@@ -665,7 +821,25 @@ class TaskDialog(tk.Toplevel):
             return
 
         task_type = self._current_type()
-        if task_type != TYPE_ONCE:
+        if task_type == TYPE_CUMULATIVE:
+            if self._parse_target() is None:
+                messagebox.showinfo(
+                    "提示", f"「总目标次数」请填写 1~{MAX_TARGET_COUNT} 之间的整数。", parent=self)
+                self.target_entry.focus_set()
+                return
+            deadline = self.deadline_picker.get_date()
+            if deadline is None:
+                messagebox.showinfo("提示", "请选择「最终截止日期」。", parent=self)
+                return
+            if deadline < datetime.now().date():
+                if not messagebox.askyesno(
+                    "确认",
+                    f"截止日期（{deadline:%Y-%m-%d}）已经过去了，保存后这条任务会直接显示"
+                    "「逾期未达标」。\n\n仍要保存吗？",
+                    parent=self,
+                ):
+                    return
+        elif task_type != TYPE_ONCE:
             if self._parse_remind() is None:
                 messagebox.showinfo(
                     "提示", f"「提前提醒」请填写 {MIN_REMIND_BEFORE}~{MAX_REMIND_BEFORE} 之间的整数（分钟）。",
@@ -704,9 +878,11 @@ class TaskDialog(tk.Toplevel):
 #: 分组键（顺序即展示顺序）
 GROUP_TODAY = "today"
 GROUP_WEEK = "week"
+GROUP_CHECKIN = "checkin"
 GROUP_OTHER = "other"
-GROUP_ORDER = (GROUP_TODAY, GROUP_WEEK, GROUP_OTHER)
-GROUP_TITLES = {GROUP_TODAY: "今日待办", GROUP_WEEK: "本周待办", GROUP_OTHER: "其他"}
+GROUP_ORDER = (GROUP_TODAY, GROUP_WEEK, GROUP_CHECKIN, GROUP_OTHER)
+GROUP_TITLES = {GROUP_TODAY: "今日待办", GROUP_WEEK: "本周待办",
+                GROUP_CHECKIN: "累计打卡", GROUP_OTHER: "其他"}
 
 #: 「本周待办」向前看的天数（含今天）
 HORIZON_DAYS = 7
@@ -714,7 +890,7 @@ HORIZON_DAYS = 7
 
 @dataclass
 class TaskRow:
-    """列表里的一行（单次任务或周期任务的"今天这一次"）。"""
+    """列表里的一行（单次任务 / 周期任务的"今天这一次" / 一条累计打卡任务）。"""
 
     task: Task
     group: str
@@ -728,10 +904,21 @@ class TaskRow:
     window: Occurrence | None = None
     log: TaskLog | None = None
     order: tuple = ()
+    #: 累计打卡任务的进度与状态（其它类型为 ``None``）
+    checkin: "CumulativeStatus | None" = None
 
     @property
     def is_recurring(self) -> bool:
         return self.task.is_recurring
+
+    @property
+    def is_cumulative(self) -> bool:
+        return self.task.is_cumulative
+
+    @property
+    def progress_text(self) -> str:
+        """累计打卡任务的进度短语（``45/60（75%）``）；其它类型为空串。"""
+        return self.checkin.progress_text() if self.checkin is not None else ""
 
     @property
     def title_text(self) -> str:
@@ -866,6 +1053,32 @@ def build_task_rows(store: UsageStore, status: str = "pending", now: datetime | 
                 order=(datetime.combine(upcoming.day, task.rule.time_start), task.title),
             ))
 
+    # ---------------------------------------------------------- 累计打卡任务
+    # 单独一组：「今天做不做」由用户自己决定，所以它不属于"今日待办"；
+    # 状态一律走 cumulative_status()，**截止日之前只会是"进行中"**。
+    counts = store.checkin_dates_map()           # 一次查询，避免逐条 COUNT/查历史
+    for task in store.cumulative_tasks():
+        state = cumulative_status(task.rule, counts.get(task.id, []), today)
+        # 过滤器：pending = 还没达成目标（含进行中与逾期未达标）；completed = 已达成
+        if status == "pending" and state.finished:
+            continue
+        if status == "completed" and not state.finished:
+            continue
+        row = TaskRow(
+            task=task, group=GROUP_CHECKIN,
+            done=state.finished, overdue=state.missed,
+            status_text=cumulative_row_texts(state)[0],
+            schedule_text=(f"每天 {format_hhmm(task.rule.remind_time or time(18, 0))} 提醒"
+                           + (f" · 截止 {task.rule.deadline:%m-%d}"
+                              if task.rule.deadline is not None else "")),
+            countdown_text=cumulative_row_texts(state)[1],
+            checkin=state,
+            # 排序：进行中的按"今天还没打卡"优先，然后是截止日近的在前
+            order=(0 if state.is_running and not state.today_checked else 1,
+                   task.rule.deadline or date.max, task.title),
+        )
+        groups[GROUP_CHECKIN].append(row)
+
     for rows in groups.values():
         rows.sort(key=lambda row: row.order)
     return groups
@@ -980,6 +1193,11 @@ class TaskPanel(ttk.Frame):
         actions.grid(row=3, column=0, sticky="ew", pady=(8, 0))
         ttk.Button(actions, text="✔ 完成 / 打卡 / 撤销", style="Small.TButton",
                    command=self.toggle_selected).pack(side="left")
+        # 累计打卡任务专用：选中打卡任务时才可用（其余情况置灰，避免点了没反应）
+        self.checkin_button = ttk.Button(actions, text="✓ 打卡任务打卡", style="Accent.TButton",
+                                         command=self.check_in_selected)
+        self.checkin_button.pack(side="left", padx=(6, 0))
+        self.checkin_button.state(["disabled"])
         ttk.Button(actions, text="✏ 编辑", style="Small.TButton",
                    command=self.edit_selected).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="⏰ 延后 1 小时", style="Small.TButton",
@@ -990,20 +1208,37 @@ class TaskPanel(ttk.Frame):
                   style="CardHint.TLabel").pack(side="right")
 
         # ---- 图表（放在下半窗格，可拖拽调整高度）----
-        chart_frame = ttk.Frame(self.paned, style="Card.TFrame")
-        self.chart = TaskStatsChart(chart_frame, self.store, font_family=self.font_family)
-        ttk.Label(chart_frame, textvariable=self.chart.summary_var, style="CardHint.TLabel").pack(
-            anchor="w", pady=(6, 0)
-        )
+        self.chart_frame = ttk.Frame(self.paned, style="Card.TFrame")
+        self.chart = TaskStatsChart(self.chart_frame, self.store, font_family=self.font_family)
+        ttk.Label(self.chart_frame, textvariable=self.chart.summary_var,
+                  style="CardHint.TLabel").pack(anchor="w", pady=(6, 0))
         self.chart.pack(fill="both", expand=True, pady=(2, 0))
-        self.paned.add(chart_frame, weight=6)         # 下：完成情况图表
+        self.paned.add(self.chart_frame, weight=6)    # 下：完成情况图表
         self.paned.bind("<Configure>", self._set_initial_sash, add="+")
+
+        # ---- 累计打卡任务详情（进度条 + 打卡热力图）----
+        # 与图表**共用**下半窗格：选中打卡任务时把图表换成打卡详情，切回其它任务再换回来。
+        # 不用"图表 + 详情"上下叠着放，是因为可用高度只有 ~700px，
+        # 再塞 200px 会把任务列表压到只剩两行。
+        #
+        # 注意这里**延迟导入**：checkin_view 要用本模块的配色常量（ACCENT/PANEL 等），
+        # 模块级互相 import 会变成循环导入（实测 ImportError: partially initialized module）。
+        # 真正干净的解法是把配色抽到独立的 theme 模块，留待后续重构。
+        from .checkin_view import CumulativeDetail      # noqa: PLC0415
+        self.detail_frame = ttk.Frame(self.paned, style="Card.TFrame")
+        self.detail = CumulativeDetail(
+            self.detail_frame, font_family=self.font_family,
+            on_check_in=self._detail_check_in, on_undo=self._detail_undo,
+        )
+        self.detail.pack(fill="both", expand=True)
+        self._detail_visible = False
 
         # 右键菜单（周期任务不能"延后"，选中周期任务时这几项会被禁用）
         self.context_menu = tk.Menu(self, tearoff=0, bg=PANEL_ALT, fg=FG,
                                     activebackground=ACCENT, activeforeground="#ffffff",
                                     font=self.font_body, bd=0)
         self.context_menu.add_command(label="标记完成 / 取消完成", command=self.toggle_selected)
+        self.context_menu.add_command(label="✓ 打卡 / 撤销今天的打卡", command=self.check_in_selected)
         self.context_menu.add_command(label="编辑任务", command=self.edit_selected)
         self.context_menu.add_separator()
         self.context_menu.add_command(label="延后 1 小时", command=lambda: self.postpone_selected(60))
@@ -1100,9 +1335,110 @@ class TaskPanel(ttk.Frame):
             except tk.TclError:
                 continue
 
+    def _sync_checkin_button(self, row: TaskRow | None) -> None:
+        """按当前选中行启用/禁用「打卡」按钮并改文案（避免"点了没反应"）。"""
+        button = getattr(self, "checkin_button", None)
+        if button is None:
+            return
+        try:
+            if row is None or not row.is_cumulative:
+                button.state(["disabled"])
+                button.configure(text="✓ 打卡任务打卡")
+                return
+            state = row.checkin
+            if state is not None and state.today_checked:
+                button.state(["!disabled"])
+                button.configure(text="↩ 撤销今日打卡")
+            elif state is not None and (state.finished or state.missed):
+                button.state(["disabled"])
+                button.configure(text="✓ 打卡任务打卡")
+            else:
+                button.state(["!disabled"])
+                button.configure(text="✓ 今日打卡")
+        except tk.TclError:
+            log.debug("同步打卡按钮失败", exc_info=True)
+
+    def _sync_detail(self, row: TaskRow | None) -> None:
+        """选中的是打卡任务 → 下半窗格显示进度条 + 热力图；否则换回 7 天图表。"""
+        want_detail = bool(row is not None and row.is_cumulative)
+        if want_detail == getattr(self, "_detail_visible", False):
+            if want_detail and row is not None:
+                self._fill_detail(row)          # 已经显示着：只更新内容（打卡后要刷新）
+            return
+        try:
+            if want_detail:
+                self.paned.forget(self.chart_frame)
+                self.paned.add(self.detail_frame, weight=6)
+                self._ensure_detail_height()
+            else:
+                self.paned.forget(self.detail_frame)
+                self.paned.add(self.chart_frame, weight=6)
+            self._detail_visible = want_detail
+        except tk.TclError:
+            log.debug("切换下半窗格失败", exc_info=True)
+            return
+        if want_detail and row is not None:
+            self._fill_detail(row)
+        else:
+            try:
+                self.detail.clear()
+            except tk.TclError:
+                log.debug("清空打卡详情失败", exc_info=True)
+
+    def _ensure_detail_height(self, needed: int = 205) -> None:
+        """打卡详情面板需要约 200px：不够就把分隔条往下推一点。
+
+        不这么做的话，热力图底部那行月份刻度会被裁掉（实测在 728 高的屏上
+        下半窗格只有 ~150px）。列表仍保留至少 90px，不会被挤没。
+        """
+        try:
+            height = self.paned.winfo_height()
+            if height < 260:
+                return
+            sash = self.paned.sashpos(0)
+            if height - sash >= needed:
+                return
+            self.paned.sashpos(0, max(90, height - needed))
+        except tk.TclError:
+            log.debug("调整打卡详情高度失败", exc_info=True)
+
+    def _fill_detail(self, row: TaskRow) -> None:
+        """把选中打卡任务的进度与历史喂给详情组件。"""
+        status = row.checkin
+        if status is None:
+            status = cumulative_status(row.task.rule, self.store.checkin_dates(row.task.id))
+        try:
+            self.detail.show_task(row.task, status)
+            self.detail.set_checked_days(self.store.checkin_dates(row.task.id))
+        except tk.TclError:
+            log.debug("刷新打卡详情失败", exc_info=True)
+
+    def _detail_check_in(self, task_id: int) -> tuple[bool, str]:
+        """详情面板里的「✓ 打卡」——和列表按钮走同一条路径。"""
+        return self._do_check_in(task_id)
+
+    def _detail_undo(self, task_id: int) -> tuple[bool, str]:
+        """详情面板里的「撤销今日打卡」。"""
+        today = datetime.now().date()
+        if not self.store.undo_check_in(task_id, today):
+            return False, "今天没有打卡记录"
+        self.refresh()
+        self._reschedule_tasks()
+        return True, "已撤销今天的打卡"
+
+    def _do_check_in(self, task_id: int) -> tuple[bool, str]:
+        """打卡并刷新界面（列表 + 详情 + 调度器）。"""
+        ok, message = self.store.check_in(task_id)
+        if ok:
+            self.refresh()
+            self._reschedule_tasks()
+        return ok, message
+
     def _update_hint(self) -> None:
         """提示条：选中行的详细信息（没选中就显示今日总览）。"""
         row = self.selected_row()
+        self._sync_checkin_button(row)
+        self._sync_detail(row)
         if row is None:
             counts = self.store.task_counts()
             text = f"待办 {counts.pending} 条"
@@ -1111,6 +1447,16 @@ class TaskPanel(ttk.Frame):
             self.hint_var.set(text)
             return
         task = row.task
+        if task.is_cumulative:
+            # 累计打卡任务：状态一律来自 cumulative_status()，
+            # 截止日之前**只可能是"进行中"**（用户的核心诉求）
+            status = row.checkin or cumulative_status(task.rule, [], datetime.now().date())
+            bits = [status.status_text(), status.progress_text(), status.countdown_text()]
+            if task.rule.deadline is not None:
+                bits.append(f"截止 {task.rule.deadline:%Y-%m-%d}")
+            bits.append(f"每天 {format_hhmm(task.rule.remind_time or time(18, 0))} 提醒")
+            self.hint_var.set("　·　".join(bits))
+            return
         if task.is_recurring:
             bits = [task.schedule_text, f"开始前 {task.rule.remind_before_minutes} 分钟提醒"]
             if row.occur_date is not None:
@@ -1158,16 +1504,21 @@ class TaskPanel(ttk.Frame):
 
     # ------------------------------------------------------------------ 增删改
     def add_task(self) -> None:
-        """弹出对话框新增任务（单次 / 每天 / 每周）。"""
+        """弹出对话框新增任务（单次 / 每天 / 每周 / 累计打卡）。"""
         dialog = TaskDialog(self, font_family=self.font_family)
         self.wait_window(dialog)
         draft = dialog.result
         if draft is None:
             return
         task_id = self.store.add_task(
-            draft.title, None if draft.is_recurring else draft.due_at, draft.priority,
+            draft.title,
+            None if (draft.is_recurring or draft.is_cumulative) else draft.due_at,
+            draft.priority,
             task_type=draft.task_type, time_start=draft.time_start, time_end=draft.time_end,
             days_of_week=draft.days_of_week, remind_before_minutes=draft.remind_before_minutes,
+            target_count=draft.target_count if draft.is_cumulative else None,
+            deadline=draft.deadline if draft.is_cumulative else None,
+            remind_time=draft.remind_time if draft.is_cumulative else None,
         )
         if task_id is None:
             messagebox.showerror(
@@ -1194,33 +1545,69 @@ class TaskPanel(ttk.Frame):
             return
         if self.store.update_task(
             task.id, title=draft.title,
-            due_at=None if draft.is_recurring else draft.due_at,
-            clear_due=draft.is_recurring and task.due_at is not None,
+            due_at=None if (draft.is_recurring or draft.is_cumulative) else draft.due_at,
+            clear_due=(draft.is_recurring or draft.is_cumulative) and task.due_at is not None,
             priority=draft.priority,
             task_type=draft.task_type, time_start=draft.time_start, time_end=draft.time_end,
             days_of_week=draft.days_of_week, remind_before_minutes=draft.remind_before_minutes,
+            target_count=draft.target_count if draft.is_cumulative else None,
+            deadline=draft.deadline if draft.is_cumulative else None,
+            remind_time=draft.remind_time if draft.is_cumulative else None,
         ):
             self.refresh()
             self._reschedule_tasks()
             self._notify_app(f"已更新任务：{draft.title}")
 
     def _on_double_click(self, event: tk.Event) -> None:
-        """双击分组节点 = 折叠 / 展开；双击任务 = 编辑。"""
+        """双击分组节点 = 折叠 / 展开；双击打卡任务 = 直接打卡；双击其它任务 = 编辑。"""
         item_id = self.tree.identify_row(event.y)
         if not item_id:
             return
         if item_id in self._group_items.values():
             self.tree.item(item_id, open=not self.tree.item(item_id, "open"))
             return
+        row = self._row_map.get(item_id)
+        if row is not None and row.is_cumulative:
+            self.check_in_selected()       # 打卡任务：双击即打卡（和周期任务双击打卡一致）
+            return
         if item_id in self._task_map:
             self.edit_selected()
 
-    def toggle_selected(self) -> None:
-        """切换选中任务的状态：单次任务标记完成，周期任务给"今天"打卡。"""
+    def check_in_selected(self) -> None:
+        """给选中的累计打卡任务打卡（已打卡则撤销当天那次）。"""
         row = self._require_row()
         if row is None:
             return
         task = row.task
+        if not task.is_cumulative:
+            messagebox.showinfo("提示", f"「{task.title}」不是累计打卡任务。", parent=self)
+            return
+        today = datetime.now().date()
+        if row.checkin is not None and row.checkin.today_checked:
+            removed = self.store.undo_check_in(task.id, today)
+            ok = bool(removed)
+            message = "已撤销今天的打卡" if ok else "撤销失败：今天没有打卡记录"
+        else:
+            ok, message = self.store.check_in(task.id, today)
+        if not ok:
+            messagebox.showinfo("提示", message, parent=self)
+            return
+        self.refresh()
+        self._reschedule_tasks()       # 今天已打卡 → 调度器要改到明天再提醒
+        self._notify_app(f"{task.title}：{message}")
+
+    def toggle_selected(self) -> None:
+        """切换选中任务的状态：单次任务标记完成，周期任务给"今天"打卡，累计任务打卡。"""
+        row = self._require_row()
+        if row is None:
+            return
+        task = row.task
+
+        if task.is_cumulative:
+            # 累计打卡任务绝不能走 complete_task()：那会写 tasks.completed，
+            # 把"打了 45 次卡"变成"这个任务永久完成了"（跟周期任务同一个坑）。
+            self.check_in_selected()
+            return
 
         if task.is_recurring:
             today = datetime.now().date()
@@ -1258,7 +1645,7 @@ class TaskPanel(ttk.Frame):
         task = self._require_selection()
         if task is None:
             return
-        extra = "（含全部打卡历史）" if task.is_recurring else ""
+        extra = "（含全部打卡历史）" if (task.is_recurring or task.is_cumulative) else ""
         if not messagebox.askyesno("确认删除", f"确定要删除任务「{task.title}」吗？{extra}", parent=self):
             return
         self.store.delete_task(task.id)
@@ -1267,9 +1654,17 @@ class TaskPanel(ttk.Frame):
         self._notify_app("任务已删除")
 
     def postpone_selected(self, minutes: int = 60) -> None:
-        """把截止时间往后推（默认 1 小时）。周期任务不支持。"""
+        """把截止时间往后推（默认 1 小时）。周期任务与累计打卡任务不支持。"""
         task = self._require_selection()
         if task is None:
+            return
+        if task.is_cumulative:
+            messagebox.showinfo(
+                "提示",
+                f"「{task.title}」是累计打卡任务，截止日期是整体目标的一部分，不能单独延后。\n\n"
+                "需要调整请在「编辑」里改「最终截止日期」。",
+                parent=self,
+            )
             return
         if task.is_recurring:
             messagebox.showinfo(
@@ -1313,10 +1708,18 @@ class TaskPanel(ttk.Frame):
             self._update_hint()
         row = self.selected_row()
         task = row.task if row is not None else None
-        label = "打卡完成 / 撤销打卡" if (task is not None and task.is_recurring) else "标记完成 / 取消完成"
+        if task is not None and task.is_cumulative:
+            checked = bool(row is not None and row.checkin is not None
+                           and row.checkin.today_checked)
+            label = "撤销今天的打卡" if checked else "✓ 今天就打卡"
+        elif task is not None and task.is_recurring:
+            label = "打卡完成 / 撤销打卡"
+        else:
+            label = "标记完成 / 取消完成"
         try:
             self.context_menu.entryconfigure(0, label=label)
-            postpone_state = "disabled" if (task is None or task.is_recurring) else "normal"
+            postpone_state = "disabled" if (task is None or task.is_recurring
+                                            or task.is_cumulative) else "normal"
             self.context_menu.entryconfigure(3, state=postpone_state)
             self.context_menu.entryconfigure(4, state=postpone_state)
         except tk.TclError:
@@ -1362,6 +1765,11 @@ class TaskPanel(ttk.Frame):
             return
         for item_id, row in self._row_map.items():
             try:
+                if row.is_cumulative:
+                    # 累计打卡任务的倒计时只有"跨天"才变，而且它的进度/剩余天数
+                    # 不能被单次任务那套 countdown_text() 覆盖（会把"还剩 60 天"
+                    # 写成"无期限"，实测踩到过）。跨天时 tick 上面已经整表 refresh 了。
+                    continue
                 if row.is_recurring:
                     text, overdue, _late = periodic_countdown(row.task, row.window, row.log, now)
                     self.tree.set(item_id, "countdown", text)
@@ -1570,14 +1978,19 @@ class RecurringReminderDialog(tk.Toplevel):
     WIDTH = 580
 
     def __init__(self, master: tk.Misc, batch, font_family: str = "Microsoft YaHei UI",
-                 on_open_tasks=None) -> None:
+                 on_open_tasks=None, on_check_in=None) -> None:
         super().__init__(master)
         self.batch = batch
         self.font_family = font_family
         self.on_open_tasks = on_open_tasks
+        #: 回调 ``(task_id) -> (是否成功, 给用户看的一句话)``；累计打卡任务的「打卡」按钮用它
+        self.on_check_in = on_check_in
         self.encouragement = phrases.pick()
+        #: task_id → 该行的按钮与说明文字，打卡成功后就地更新（不重开窗口）
+        self._checkin_rows: dict[int, dict] = {}
 
-        self.title("TimeGuard 周期任务提醒")
+        only_checkin = bool(batch.items) and all(i.is_cumulative for i in batch.items)
+        self.title("TimeGuard 打卡提醒" if only_checkin else "TimeGuard 周期任务提醒")
         self.configure(bg=PANEL)
         self.resizable(False, False)
         try:
@@ -1640,7 +2053,8 @@ class RecurringReminderDialog(tk.Toplevel):
         # ---- 按钮 ----
         buttons = ttk.Frame(outer, style="Card.TFrame")
         buttons.pack(fill="x", pady=(14, 0))
-        ttk.Button(buttons, text="知道了，这就开始", style="Accent.TButton",
+        primary = "知道了" if all(i.is_cumulative for i in items) else "知道了，这就开始"
+        ttk.Button(buttons, text=primary, style="Accent.TButton",
                    command=self.close).pack(side="right")
         if self.on_open_tasks is not None:
             ttk.Button(buttons, text="查看待办列表", style="Small.TButton",
@@ -1649,7 +2063,7 @@ class RecurringReminderDialog(tk.Toplevel):
                    command=self._shuffle_quote).pack(side="left")
 
     def _build_row(self, parent: tk.Misc, index: int, item) -> None:
-        """一行：序号 + 任务名 + 时间窗 + 提醒类型。"""
+        """一行：序号 + 任务名 + 说明（打卡任务额外给一个「打卡」按钮）。"""
         row = tk.Frame(parent, bg=PANEL_ALT)
         row.pack(fill="x", padx=10, pady=(8, 0))
         colour = AMBER if item.is_late else ACCENT
@@ -1657,16 +2071,44 @@ class RecurringReminderDialog(tk.Toplevel):
         tk.Label(row, text="!" if item.is_late else "○", bg=PANEL_ALT, fg=colour,
                  font=(self.font_family, 12, "bold"), width=2).pack(side="left", anchor="n")
 
+        # 打卡按钮先占右侧位置，文字区再填充剩余空间（顺序反了会被挤出去）
+        button = None
+        if item.is_cumulative and callable(self.on_check_in):
+            button = ttk.Button(row, text="✓ 打卡", style="Accent.TButton",
+                                command=lambda it=item: self._do_check_in(it))
+            button.pack(side="right", padx=(8, 0), pady=(2, 0))
+
         text_box = tk.Frame(row, bg=PANEL_ALT)
         text_box.pack(side="left", fill="x", expand=True)
         prefix = f"{index}. " if self.batch.count > 1 else ""
         tk.Label(text_box, text=f"{prefix}{item.title}", bg=PANEL_ALT, fg=FG, anchor="w",
-                 justify="left", wraplength=self.WIDTH - 170,
+                 justify="left", wraplength=self.WIDTH - 220,
                  font=(self.font_family, 11, "bold")).pack(fill="x")
-        tk.Label(text_box,
-                 text=f"时间：{item.window_text}　·　{item.kind_label}",
-                 bg=PANEL_ALT, fg=colour, anchor="w",
-                 font=self._font_small()).pack(fill="x")
+        detail = tk.Label(text_box, text=item.detail_text, bg=PANEL_ALT, fg=colour,
+                          anchor="w", justify="left", wraplength=self.WIDTH - 220,
+                          font=self._font_small())
+        detail.pack(fill="x")
+        if button is not None:
+            self._checkin_rows[item.task.id] = {"button": button, "detail": detail, "item": item}
+
+    def _do_check_in(self, item) -> None:
+        """就地点一次「打卡」：成功就把按钮换成结果，不再骚扰。"""
+        ok, message = False, "打卡失败"
+        try:
+            ok, message = self.on_check_in(item.task.id)
+        except Exception:  # noqa: BLE001 - 界面异常不能让弹窗崩掉
+            log.exception("打卡回调异常")
+        row = self._checkin_rows.get(item.task.id)
+        if row is None:
+            return
+        try:
+            if ok:
+                row["detail"].configure(text=message, fg=GREEN)
+                row["button"].configure(text="✓ 已打卡", state="disabled")
+            else:
+                row["detail"].configure(text=message, fg=AMBER)
+        except tk.TclError:
+            log.debug("刷新打卡行失败", exc_info=True)
 
     def _shuffle_quote(self) -> None:
         self.encouragement = phrases.pick(exclude=self.encouragement)
@@ -1888,8 +2330,8 @@ class StartupCheckDialog(tk.Toplevel):
         tk.Label(box, text=f"{index}. {item.title}", bg=PANEL_ALT, fg=FG, anchor="w",
                  justify="left", wraplength=self.WIDTH - 170,
                  font=(self.font_family, 11, "bold")).pack(fill="x")
-        tk.Label(box, text=f"时间：{item.window_text}　·　{item.kind_label}",
-                 bg=PANEL_ALT, fg=AMBER, anchor="w",
+        tk.Label(box, text=item.detail_text, bg=PANEL_ALT, fg=AMBER, anchor="w",
+                 justify="left", wraplength=self.WIDTH - 170,
                  font=self._font_small()).pack(fill="x")
 
     def _build_task_row(self, parent: tk.Misc, task: Task) -> None:

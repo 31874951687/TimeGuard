@@ -28,9 +28,35 @@ log = logging.getLogger(__name__)
 TYPE_ONCE = "once"
 TYPE_DAILY = "daily"
 TYPE_WEEKLY = "weekly"
-TASK_TYPES = (TYPE_ONCE, TYPE_DAILY, TYPE_WEEKLY)
+#: 累计打卡任务：在最终截止日期前攒够 N 次（例如"年末前完成 60 次两公里跑"）。
+#: 它跟每天/每周最大的区别是**没有"今天必须做"的概念** —— 哪一天打卡由用户自己决定，
+#: 系统只负责每天到点提醒一次、记录次数、算进度，**在截止日之前绝不能说"逾期"**。
+TYPE_CUMULATIVE = "cumulative"
+TASK_TYPES = (TYPE_ONCE, TYPE_DAILY, TYPE_WEEKLY, TYPE_CUMULATIVE)
 
-TYPE_LABELS = {TYPE_ONCE: "单次", TYPE_DAILY: "每天", TYPE_WEEKLY: "每周"}
+TYPE_LABELS = {TYPE_ONCE: "单次", TYPE_DAILY: "每天", TYPE_WEEKLY: "每周",
+               TYPE_CUMULATIVE: "累计打卡"}
+
+#: 累计打卡任务的状态（用户的核心诉求：截止日之前只有"进行中"，没有"逾期"）
+STATE_RUNNING = "running"            # 进行中：还没到截止日，也没攒够次数
+STATE_DONE_EARLY = "done_early"      # 提前完成：截止日之前就攒够了
+STATE_DONE_DEADLINE = "done"         # 压哨完成：截止日当天攒够（当天 23:59 打卡都算）
+STATE_MISSED = "missed"              # 逾期未达标：**今天 > 截止日** 且次数不够
+
+STATE_LABELS = {
+    STATE_RUNNING: "进行中",
+    STATE_DONE_EARLY: "提前完成",
+    STATE_DONE_DEADLINE: "压哨完成",
+    STATE_MISSED: "逾期未达标",
+}
+
+#: 已完成（不论提前还是压哨）—— 到这个状态就必须停掉每日提醒（避坑 #1）
+STATE_FINISHED = (STATE_DONE_EARLY, STATE_DONE_DEADLINE)
+
+#: 累计打卡任务的默认值
+DEFAULT_TARGET_COUNT = 30
+MAX_TARGET_COUNT = 9999
+DEFAULT_REMIND_TIME = "18:00"
 
 #: 星期中文名（ISO：1=周一）
 WEEKDAY_CN = {1: "周一", 2: "周二", 3: "周三", 4: "周四", 5: "周五", 6: "周六", 7: "周日"}
@@ -125,6 +151,135 @@ def format_hhmm(value: time) -> str:
     return f"{value.hour:02d}:{value.minute:02d}"
 
 
+@dataclass(frozen=True)
+class CumulativeStatus:
+    """累计打卡任务的进度与状态（**纯数据**，由 :func:`cumulative_status` 算出）。
+
+    界面只认这个对象，不许自己再写一套判断 —— 否则"列表说进行中、图表说逾期"
+    这种自相矛盾迟早会出现。
+    """
+
+    total: int                     # 已打卡次数
+    target: int                    # 目标次数
+    state: str                     # STATE_* 之一
+    deadline: date | None = None   # 最终截止日期
+    today: date | None = None      # 计算时的"今天"（测试用）
+    today_checked: bool = False    # 今天是否已经打卡
+    reached_on: date | None = None # 达成目标的那一天（没达成为 None）
+
+    @property
+    def remaining(self) -> int:
+        """还差几次。"""
+        return max(0, self.target - self.total)
+
+    @property
+    def finished(self) -> bool:
+        """是否已达成目标（提前完成 / 压哨完成都算）。"""
+        return self.state in STATE_FINISHED
+
+    @property
+    def missed(self) -> bool:
+        """是否已判定逾期未达标。"""
+        return self.state == STATE_MISSED
+
+    @property
+    def is_running(self) -> bool:
+        return self.state == STATE_RUNNING
+
+    @property
+    def days_left(self) -> int | None:
+        """距截止日还有几天（今天 = 0；已过期为负数；没有截止日返回 None）。"""
+        if self.deadline is None or self.today is None:
+            return None
+        return (self.deadline - self.today).days
+
+    @property
+    def ratio(self) -> float:
+        """完成比例 0.0 ~ 1.0（给进度条用）。"""
+        return min(1.0, self.total / self.target) if self.target else 0.0
+
+    @property
+    def percent(self) -> int:
+        """完成百分比（整数，给文字用）。"""
+        return int(round(self.ratio * 100))
+
+    @property
+    def state_label(self) -> str:
+        return STATE_LABELS.get(self.state, self.state)
+
+    def status_text(self) -> str:
+        """任务列表里"状态"那一列的文案。
+
+        硬性要求（用户原话）：**截止日期到来之前，绝不能出现"逾期"或"失败"字样**，
+        只能显示"今日未打卡"或"距离目标还差 X 次"，状态保持"进行中"。
+        """
+        if self.state == STATE_RUNNING:
+            head = "✓ 今日已打卡" if self.today_checked else "○ 今日未打卡"
+            if self.remaining > 0:
+                return f"{head} · 还差 {self.remaining} 次"
+            return head
+        if self.state == STATE_DONE_EARLY:
+            when = f"（{self.reached_on:%m-%d} 达标）" if self.reached_on else ""
+            return f"★ 提前完成{when}"
+        if self.state == STATE_DONE_DEADLINE:
+            return "★ 压哨完成（截止日当天达标）"
+        return f"✗ 逾期未达标（差 {self.remaining} 次）"
+
+    def countdown_text(self) -> str:
+        """"剩余 / 超期"那一列的文案。"""
+        if self.state == STATE_MISSED:
+            over = abs(self.days_left or 0)
+            return f"已过期 {over} 天"
+        if self.finished:
+            return "已达成目标"
+        left = self.days_left
+        if left is None:
+            return "无截止日期"
+        if left == 0:
+            return "今天是最后一天"
+        return f"还剩 {left} 天"
+
+    def progress_text(self) -> str:
+        """``已打卡 45/60 次（75%）``。"""
+        return f"已打卡 {self.total}/{self.target} 次（{self.percent}%）"
+
+
+def cumulative_status(rule: TaskRule, checkin_dates, today: date | None = None) -> CumulativeStatus:
+    """算出累计打卡任务此刻的进度与状态（纯函数，不碰数据库）。
+
+    ``checkin_dates`` 是这条任务**已打卡的自然日**列表（可以乱序、可重复，内部会去重）。
+
+    判定规则（严格按用户的核心诉求，也是避坑 #5）::
+
+        今天 > 截止日 且 已打卡 < 目标   → 逾期未达标（唯一会显示"逾期"的情况）
+        已打卡 >= 目标，达成日 <  截止日 → 提前完成（并停止后续提醒）
+        已打卡 >= 目标，达成日 >= 截止日 → 压哨完成（截止日当天 23:59 打卡也算完成）
+        其余（含截止日当天还没攒够）     → 进行中，只显示"今日未打卡 / 还差 X 次"
+
+    注意"达成日"取的是**第 N 次打卡那一天**（N = 目标次数），不是"最后一次打卡"：
+    第 61、62 次补打卡不会把"提前完成"改成"压哨完成"。
+    """
+    today = today or date.today()
+    target = max(1, int(rule.target_count or 1))
+    days = sorted({d for d in checkin_dates if isinstance(d, date)})
+    total = len(days)
+    reached_on = days[target - 1] if total >= target else None
+
+    if reached_on is not None:
+        if rule.deadline is not None and reached_on >= rule.deadline:
+            state = STATE_DONE_DEADLINE
+        else:
+            state = STATE_DONE_EARLY
+    elif rule.deadline is not None and today > rule.deadline:
+        state = STATE_MISSED
+    else:
+        state = STATE_RUNNING
+
+    return CumulativeStatus(total=total, target=target, state=state,
+                            deadline=rule.deadline, today=today,
+                            today_checked=today in days, reached_on=reached_on)
+
+
 def weekdays_text(days) -> str:
     """``(1,3,5)`` → ``"周一、周三、周五"``；每天/无则给相应文案。"""
     parsed = parse_iso_weekdays(format_iso_weekdays(days))
@@ -195,6 +350,13 @@ class TaskRule:
     #: 从哪一天开始生效（``None`` = 一直有效，老数据就是这种）。
     #: 用来实现"现在才建、时间已过 → 从明天开始"，见 :func:`suggested_start_date`。
     start_date: date | None = None
+    # ---- 以下是"累计打卡"专用（其它类型一律为 None）----
+    #: 总目标次数（例如 60 次）
+    target_count: int | None = None
+    #: 最终截止日期（含当天：截止日 23:59 打卡仍然算数，见 :func:`cumulative_status`）
+    deadline: date | None = None
+    #: 每日提醒时间（一个时间点，不是时间窗）
+    remind_time: time | None = None
 
     def __post_init__(self) -> None:
         """归一化：结束时间不得早于/等于开始时间（否则当天那次会被跳过）。
@@ -204,6 +366,10 @@ class TaskRule:
         """
         if self.is_recurring and self.time_end <= self.time_start:
             object.__setattr__(self, "time_end", time(23, 59))
+        if self.is_cumulative:
+            # 目标次数至少 1，否则"攒够 0 次"会立刻变成已完成
+            target = self.target_count if self.target_count else DEFAULT_TARGET_COUNT
+            object.__setattr__(self, "target_count", max(1, min(MAX_TARGET_COUNT, int(target))))
 
     # ---------------------------------------------------------------- 构造
     @classmethod
@@ -229,6 +395,10 @@ class TaskRule:
             before = int(get("remind_before_minutes"))
         except (TypeError, ValueError):
             before = DEFAULT_REMIND_BEFORE
+        try:
+            target = int(get("target_count"))
+        except (TypeError, ValueError):
+            target = None
         return cls(
             task_type=task_type,
             time_start=start,
@@ -236,7 +406,21 @@ class TaskRule:
             days_of_week=parse_iso_weekdays(get("days_of_week")),
             remind_before_minutes=max(MIN_REMIND_BEFORE, min(MAX_REMIND_BEFORE, before)),
             start_date=_parse_date(get("start_date")),
+            target_count=target,
+            deadline=_parse_date(get("deadline")),
+            remind_time=(parse_hhmm(get("remind_time"), DEFAULT_REMIND_TIME)
+                         if get("remind_time") else None),
         )
+
+    @classmethod
+    def cumulative(cls, target_count: int, deadline: date | str | None,
+                   remind_time: str = DEFAULT_REMIND_TIME) -> "TaskRule":
+        """构造一条累计打卡规则（界面与测试都用这个，保证跟库里的读法一致）。"""
+        deadline_date = _parse_date(deadline) if not isinstance(deadline, date) else deadline
+        return cls(task_type=TYPE_CUMULATIVE,
+                   target_count=max(1, min(MAX_TARGET_COUNT, int(target_count))),
+                   deadline=deadline_date,
+                   remind_time=parse_hhmm(remind_time, DEFAULT_REMIND_TIME))
 
     @classmethod
     def daily(cls, start: str = DEFAULT_START, end: str = DEFAULT_END,
@@ -260,8 +444,55 @@ class TaskRule:
         return self.task_type in (TYPE_DAILY, TYPE_WEEKLY)
 
     @property
+    def is_cumulative(self) -> bool:
+        """是否为累计打卡任务。"""
+        return self.task_type == TYPE_CUMULATIVE
+
+    @property
     def type_label(self) -> str:
         return TYPE_LABELS.get(self.task_type, self.task_type)
+
+    # ------------------------------------------------- 累计打卡：提醒与期限
+    def checkin_reminder_on(self, day: date) -> datetime:
+        """``day`` 这一天的"该打卡了"提醒时刻。"""
+        return datetime.combine(day, self.remind_time or time(18, 0))
+
+    def is_expired(self, today: date) -> bool:
+        """**已经过了**截止日（截止日当天返回 False —— 当天仍可打卡）。"""
+        return self.deadline is not None and today > self.deadline
+
+    def next_checkin_reminder(self, now: datetime, *, day_done: bool = False,
+                              finished: bool = False) -> datetime | None:
+        """严格晚于 ``now`` 的下一次"该打卡了"提醒；不该再提醒时返回 ``None``。
+
+        这就是避坑 #1 要求的"提前完成后停止骚扰"：
+        ``finished=True``（已攒够次数）或已过截止日 → 直接 ``None``，调度器不会再排定时器。
+        当天已经打过卡 → 下一次顺延到明天（不再提醒今天）。
+        """
+        if finished or self.deadline is None:
+            return None
+        today = now.date()
+        if self.is_expired(today):
+            return None
+        for offset in range(0, 3):                 # 今天 / 明天 / 后天，足够跨过"今天已打卡"
+            day = today + timedelta(days=offset)
+            if self.is_expired(day):
+                return None
+            if offset == 0 and day_done:
+                continue
+            moment = self.checkin_reminder_on(day)
+            if moment > now:
+                return moment
+        return None
+
+    def checkin_schedule_text(self) -> str:
+        """累计打卡任务的一句话描述，例如 ``累计打卡 60 次 · 截止 12-31 · 每天 18:00 提醒``。"""
+        target = self.target_count or 1
+        text = f"累计打卡 {target} 次"
+        if self.deadline is not None:
+            text += f" · 截止 {self.deadline:%Y-%m-%d}"
+        text += f" · 每天 {format_hhmm(self.remind_time or time(18, 0))} 提醒"
+        return text
 
     def occurs_on(self, day: date) -> bool:
         """``day`` 这一天是否需要做这件事（生效日之前一律为否）。"""
@@ -287,6 +518,8 @@ class TaskRule:
 
     def schedule_text(self) -> str:
         """给界面用的一句话描述，例如 ``每天 18:00~20:00``。"""
+        if self.is_cumulative:
+            return self.checkin_schedule_text()
         span = f"{format_hhmm(self.time_start)}~{format_hhmm(self.time_end)}"
         if self.task_type == TYPE_DAILY:
             text = f"每天 {span}"

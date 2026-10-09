@@ -200,6 +200,37 @@ def selftest() -> int:
         ok = False
         report(f"[失败] 周期任务异常：{type(exc).__name__} {exc}")
 
+    # 5b) 累计打卡任务：打卡记录 / 防重复 / "截止日之前绝不判逾期"
+    try:
+        from . import recurrence as rec_mod
+
+        cum_id = store.add_task(
+            "__selftest__ 年末前完成 60 次两公里跑", task_type=rec_mod.TYPE_CUMULATIVE,
+            target_count=60, deadline=(datetime.now().date() + timedelta(days=60)).strftime("%Y-%m-%d"),
+            remind_time="18:00")
+        assert cum_id is not None
+        cum_task = store.get_task(cum_id)
+        assert cum_task is not None and cum_task.is_cumulative
+        assert cum_task.rule.target_count == 60 and cum_task.rule.remind_time is not None
+        today = datetime.now().date()
+        store.check_in(cum_id, today - timedelta(days=1))
+        first_ok, _ = store.check_in(cum_id, today)
+        second_ok, second_msg = store.check_in(cum_id, today)      # 同一天只能打一次
+        assert first_ok is True and second_ok is False, "同一天应该只能打卡一次"
+        assert store.checkin_count(cum_id) == 2
+        cum_status = store.task_status(cum_id)
+        assert cum_status is not None and cum_status.is_running, cum_status
+        assert "逾期" not in cum_status.status_text(), cum_status.status_text()
+        assert store.get_task(cum_id).completed is False, "累计打卡绝不能写 tasks.completed"
+        report(f"[ OK ] 累计打卡任务正常（{cum_status.status_text()}；"
+               f"{cum_status.progress_text()}；{cum_status.countdown_text()}）")
+        report(f"[ OK ] 同一天重复打卡已被拦下（{second_msg}）")
+        report("[ OK ] 截止日之前状态是「进行中」，不会出现「逾期」字样")
+        store.delete_task(cum_id)
+    except Exception as exc:  # noqa: BLE001
+        ok = False
+        report(f"[失败] 累计打卡任务异常：{type(exc).__name__} {exc}")
+
     # 6) 鼓励语库与开机自启
     from . import phrases as phrases_mod
     from .datepicker import backend_name

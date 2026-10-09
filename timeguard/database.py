@@ -29,14 +29,20 @@ from . import paths
 from .recurrence import (
     DEFAULT_END,
     DEFAULT_REMIND_BEFORE,
+    DEFAULT_REMIND_TIME,
     DEFAULT_START,
+    DEFAULT_TARGET_COUNT,
     MAX_REMIND_BEFORE,
+    MAX_TARGET_COUNT,
     MIN_REMIND_BEFORE,
+    TYPE_CUMULATIVE,
     TYPE_DAILY,
     TYPE_ONCE,
     TYPE_WEEKLY,
     TASK_TYPES,
+    CumulativeStatus,
     TaskRule,
+    cumulative_status,
     format_hhmm,
     format_iso_weekdays,
     parse_hhmm,
@@ -103,7 +109,11 @@ CREATE TABLE IF NOT EXISTS tasks (
     time_end               TEXT,                             -- 周期任务时间窗结束 'HH:MM'
     days_of_week           TEXT,                             -- 每周任务：ISO 星期，如 '1,3,5'（1=周一）
     remind_before_minutes  INTEGER NOT NULL DEFAULT 15,      -- 提前多少分钟提醒
-    start_date             TEXT                              -- 生效起始日 'YYYY-MM-DD'（空=一直有效）
+    start_date             TEXT,                             -- 生效起始日 'YYYY-MM-DD'（空=一直有效）
+    -- ↓ v1.5 累计打卡任务（例如"年末前完成 60 次两公里跑"）
+    target_count           INTEGER,                          -- 总目标次数，如 60
+    deadline               TEXT,                             -- 最终截止日期 'YYYY-MM-DD'（含当天）
+    remind_time            TEXT                              -- 每日提醒时间 'HH:MM'
 );
 CREATE INDEX IF NOT EXISTS idx_tasks_completed ON tasks(completed);
 CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_at);
@@ -127,6 +137,25 @@ CREATE TABLE IF NOT EXISTS task_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_task_logs_date ON task_logs(occur_date);
 CREATE INDEX IF NOT EXISTS idx_task_logs_task ON task_logs(task_id, occur_date);
+
+-- ============================ 累计打卡任务的打卡历史 ============================
+-- 一条记录 = 某一天打的一次卡。这是画进度条与热力图**唯一**的数据来源
+-- （只存一个 current_count 字段是不够的：图表需要知道你是哪一天打的卡）。
+--
+-- UNIQUE(task_id, checkin_date) 是"同一天只能打一次卡"的数据库级保证：
+-- 界面上多点两下、逻辑里算错一次，都写不进第二条 —— 与 task_logs 同一思路。
+CREATE TABLE IF NOT EXISTS check_in_logs (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id      INTEGER NOT NULL,                     -- 对应 tasks.id
+    checkin_date TEXT    NOT NULL,                     -- 打卡归属的自然日 'YYYY-MM-DD'（本地时区）
+    checkin_at   TEXT    NOT NULL,                     -- 实际打卡时刻（精确到秒，用于展示/审计）
+    note         TEXT,                                 -- 备注
+    source       TEXT    NOT NULL DEFAULT 'manual',    -- manual 手动 / backfill 补签（预留）
+    FOREIGN KEY (task_id) REFERENCES tasks(id) ON DELETE CASCADE,
+    UNIQUE (task_id, checkin_date)
+);
+CREATE INDEX IF NOT EXISTS idx_checkin_task_date ON check_in_logs(task_id, checkin_date);
+CREATE INDEX IF NOT EXISTS idx_checkin_date ON check_in_logs(checkin_date);
 """
 
 #: 老库升级用：v1.1 之后的 tasks 表新增列（``CREATE TABLE IF NOT EXISTS`` 不会补列，需要 ALTER）
@@ -142,6 +171,10 @@ _TASK_COLUMN_MIGRATIONS: tuple[tuple[str, str], ...] = (
     ("remind_before_minutes", "INTEGER NOT NULL DEFAULT 15"),
     # v1.4：生效起始日（"晚上才建的每日任务"从明天开始算，不再立刻显示逾期）
     ("start_date", "TEXT"),
+    # v1.5 累计打卡任务
+    ("target_count", "INTEGER"),
+    ("deadline", "TEXT"),
+    ("remind_time", "TEXT"),
 )
 
 #: 依赖新增列的索引：必须在补列之后再建，否则老库打开时会报 no such column
@@ -286,20 +319,78 @@ class Task:
 
     @property
     def schedule_text(self) -> str:
-        """给界面用的一句话计划描述。"""
-        if self.is_recurring:
+        """给界面用的一句话计划描述。
+
+        注意这里必须返回**字符串**：以前非周期分支返回的是 ``self.due_text``
+        （一个绑定方法对象），一旦被塞进 f-string，界面上就会出现
+        ``<bound method Task.due_text of ...>`` 这种东西。
+        """
+        if self.is_recurring or self.is_cumulative:
             return self.rule.schedule_text()
-        return self.due_text
+        return self.due_text()
 
     def occurrence_on(self, day: date):
         """``day`` 这一天的发生窗口（单次任务或不在计划内返回 ``None``）。"""
         return self.rule.window_on(day) if self.is_recurring else None
 
+    @property
+    def is_cumulative(self) -> bool:
+        """是否为累计打卡任务。"""
+        return self.rule.is_cumulative
+
+
+def _coerce_date(raw) -> date | None:
+    """把 ``"2026-12-31"`` / ``date`` / ``datetime`` 统一成 ``date``（失败返回 None）。"""
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, date):
+        return raw
+    try:
+        return datetime.strptime(str(raw).strip()[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return None
+
+
+@dataclass(frozen=True)
+class CheckInLog:
+    """累计打卡任务的一次打卡（check_in_logs 表的一行）。"""
+
+    id: int
+    task_id: int
+    checkin_date: str                  # 'YYYY-MM-DD'（自然日，本地时区）
+    checkin_at: datetime | None = None  # 实际打卡时刻
+    note: str = ""
+    source: str = "manual"             # manual 手动 / backfill 补签
+
+    @property
+    def day(self) -> date:
+        return datetime.strptime(self.checkin_date[:10], "%Y-%m-%d").date()
+
+    @property
+    def time_text(self) -> str:
+        return self.checkin_at.strftime("%H:%M:%S") if self.checkin_at else ""
+
+    @property
+    def source_label(self) -> str:
+        return {"manual": "手动打卡", "backfill": "补签"}.get(self.source, self.source)
+
+    @classmethod
+    def from_row(cls, row: sqlite3.Row) -> "CheckInLog":
+        return cls(
+            id=int(row["id"]),
+            task_id=int(row["task_id"]),
+            checkin_date=str(row["checkin_date"]),
+            checkin_at=_parse_ts(_row_get(row, "checkin_at")),
+            note=_row_get(row, "note") or "",
+            source=_row_get(row, "source") or "manual",
+        )
+
 
 @dataclass(frozen=True)
 class TaskLog:
     """周期任务某一次发生的记录（task_logs 表的一行）。"""
-
     id: int
     task_id: int
     occur_date: str            # 'YYYY-MM-DD'
@@ -586,10 +677,13 @@ class UsageStore:
                  time_end: str | None = None,
                  days_of_week: str | None = None,
                  remind_before_minutes: int = DEFAULT_REMIND_BEFORE,
-                 start_date: str | None = None) -> int | None:
+                 start_date: str | None = None,
+                 target_count: int | None = None,
+                 deadline: str | date | None = None,
+                 remind_time: str | None = None) -> int | None:
         """新增待办任务，返回新任务 ID（失败返回 None）。
 
-        :param task_type: ``once`` 单次 / ``daily`` 每天 / ``weekly`` 每周
+        :param task_type: ``once`` 单次 / ``daily`` 每天 / ``weekly`` 每周 / ``cumulative`` 累计打卡
         :param time_start: 周期任务时间窗开始 ``'HH:MM'``
         :param time_end:   周期任务时间窗结束 ``'HH:MM'``
         :param days_of_week: 每周任务用，ISO 星期如 ``'1,3,5'``（1=周一）
@@ -597,6 +691,9 @@ class UsageStore:
         :param start_date: 从哪天开始生效（``'YYYY-MM-DD'``）。
             ``None``（默认）= 自动判断：**今天的时间窗已经过去就从明天开始**；
             传空串表示不限制（老数据就是这种，任何一天都排班）。
+        :param target_count: 累计打卡任务的总目标次数（如 60）
+        :param deadline: 累计打卡任务的最终截止日期（**含当天**）
+        :param remind_time: 累计打卡任务的每日提醒时间 ``'HH:MM'``
         """
         title = (title or "").strip()
         if not title:
@@ -607,7 +704,27 @@ class UsageStore:
             # 单次任务不保留周期字段，避免语义混淆
             time_start = time_end = days_of_week = None
             start_date = None
+            target_count, deadline, remind_time = None, None, None
+        elif task_type == TYPE_CUMULATIVE:
+            # 累计打卡任务：只认"目标次数 + 截止日期 + 每日提醒时间"，
+            # time_start/time_end/days_of_week 一律留空 —— 它没有"今天几点到几点做"的概念，
+            # 留着会让窗口判定、列表文案、统计口径通通多出一份假计划。
+            due_at = None
+            time_start = time_end = days_of_week = None
+            start_date = None
+            try:
+                target = int(target_count) if target_count is not None else DEFAULT_TARGET_COUNT
+            except (TypeError, ValueError):
+                target = DEFAULT_TARGET_COUNT
+            target_count = max(1, min(MAX_TARGET_COUNT, target))
+            deadline_date = _coerce_date(deadline)
+            if deadline_date is None:
+                log.warning("新增累计打卡任务失败：没有有效的截止日期")
+                return None
+            deadline = deadline_date.strftime("%Y-%m-%d")
+            remind_time = format_hhmm(parse_hhmm(remind_time, DEFAULT_REMIND_TIME))
         else:
+            target_count, deadline, remind_time = None, None, None
             # 周期任务的时间由 time_start/time_end 表达，due_at 没有意义：
             # 留着它会让"单次任务按 due_at 排列表/统计"的口径被污染（图表里凭空多一条）。
             due_at = None
@@ -638,8 +755,9 @@ class UsageStore:
                     """
                     INSERT INTO tasks(title, due_at, created_at, completed, priority, note,
                                       task_type, time_start, time_end, days_of_week,
-                                      remind_before_minutes, start_date)
-                    VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
+                                      remind_before_minutes, start_date,
+                                      target_count, deadline, remind_time)
+                    VALUES(?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         title[:200],
@@ -653,6 +771,9 @@ class UsageStore:
                         days_of_week,
                         before,
                         start_date,
+                        target_count,
+                        deadline,
+                        remind_time,
                     ),
                 )
                 self._conn.commit()
@@ -725,6 +846,197 @@ class UsageStore:
         if isinstance(day, str):
             day = datetime.strptime(day[:10], "%Y-%m-%d").date()
         return [task for task in self.recurring_tasks() if task.rule.occurs_on(day)]
+
+    # ------------------------------------------------------------------ 累计打卡任务
+    def cumulative_tasks(self) -> list[Task]:
+        """全部累计打卡任务（按截止日期从近到远）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM tasks
+                WHERE COALESCE(task_type, 'once') = ?
+                ORDER BY (deadline IS NULL) ASC, deadline ASC, id ASC
+                """,
+                (TYPE_CUMULATIVE,),
+            ).fetchall()
+        return [Task.from_row(row) for row in rows]
+
+    def checkin_dates(self, task_id: int) -> list[date]:
+        """某任务已打卡的自然日（升序、去重）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT checkin_date FROM check_in_logs WHERE task_id = ? ORDER BY checkin_date ASC",
+                (int(task_id),),
+            ).fetchall()
+        result: list[date] = []
+        for row in rows:
+            try:
+                result.append(datetime.strptime(str(row["checkin_date"])[:10], "%Y-%m-%d").date())
+            except ValueError:
+                continue
+        return result
+
+    def checkin_count(self, task_id: int) -> int:
+        """某任务累计打卡次数。"""
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT COUNT(*) AS n FROM check_in_logs WHERE task_id = ?", (int(task_id),)
+            ).fetchone()
+        return int(row["n"] or 0)
+
+    def checkin_counts(self) -> dict[int, int]:
+        """**一次查询**取回所有任务的打卡次数（列表刷新时避免 N+1 查询）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, COUNT(*) AS n FROM check_in_logs GROUP BY task_id"
+            ).fetchall()
+        return {int(row["task_id"]): int(row["n"] or 0) for row in rows}
+
+    def checkin_dates_map(self) -> dict[int, list[date]]:
+        """**一次查询**取回所有任务的打卡日期列表（列表刷新用，避免逐条查）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id, checkin_date FROM check_in_logs ORDER BY checkin_date ASC"
+            ).fetchall()
+        result: dict[int, list[date]] = {}
+        for row in rows:
+            try:
+                day = datetime.strptime(str(row["checkin_date"])[:10], "%Y-%m-%d").date()
+            except ValueError:
+                continue
+            result.setdefault(int(row["task_id"]), []).append(day)
+        return result
+
+    def checkin_log(self, task_id: int, day: date | str) -> CheckInLog | None:
+        """某任务某一天的打卡记录（没有则 ``None``）。"""
+        key = day.strftime("%Y-%m-%d") if isinstance(day, date) else str(day)[:10]
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM check_in_logs WHERE task_id = ? AND checkin_date = ?",
+                (int(task_id), key),
+            ).fetchone()
+        return CheckInLog.from_row(row) if row else None
+
+    def checkin_logs(self, task_id: int, since: date | None = None,
+                     until: date | None = None) -> list[CheckInLog]:
+        """某任务的打卡历史（可选日期区间，升序）—— 画热力图/日历用。"""
+        sql = "SELECT * FROM check_in_logs WHERE task_id = ?"
+        params: list[object] = [int(task_id)]
+        if since is not None:
+            sql += " AND checkin_date >= ?"
+            params.append(since.strftime("%Y-%m-%d"))
+        if until is not None:
+            sql += " AND checkin_date <= ?"
+            params.append(until.strftime("%Y-%m-%d"))
+        sql += " ORDER BY checkin_date ASC"
+        with self._lock:
+            rows = self._conn.execute(sql, params).fetchall()
+        return [CheckInLog.from_row(row) for row in rows]
+
+    def checkin_ids_on(self, day: date | str) -> set[int]:
+        """``day`` 这一天打过卡的任务 id 集合（一次查询，列表/统计用）。"""
+        key = day.strftime("%Y-%m-%d") if isinstance(day, date) else str(day)[:10]
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT task_id FROM check_in_logs WHERE checkin_date = ?", (key,)
+            ).fetchall()
+        return {int(row["task_id"]) for row in rows}
+
+    def checkin_logs_between(self, start: date, end: date) -> list[CheckInLog]:
+        """某个日期区间内**所有**任务的打卡记录（统计图表用，一次查完）。"""
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT * FROM check_in_logs
+                WHERE checkin_date >= ? AND checkin_date <= ?
+                ORDER BY checkin_date ASC, task_id ASC
+                """,
+                (start.strftime("%Y-%m-%d"), end.strftime("%Y-%m-%d")),
+            ).fetchall()
+        return [CheckInLog.from_row(row) for row in rows]
+
+    def task_status(self, task) -> "CumulativeStatus | None":
+        """累计打卡任务的进度与状态（``task`` 可以是 ``Task`` 或 task_id）。"""
+        task_obj = self.get_task(int(task)) if isinstance(task, int) else task
+        if task_obj is None or not task_obj.is_cumulative:
+            return None
+        return cumulative_status(task_obj.rule, self.checkin_dates(task_obj.id))
+
+    def check_in(self, task_id: int, day: date | str | None = None,
+                 note: str = "", source: str = "manual",
+                 now: datetime | None = None) -> tuple[bool, str]:
+        """给累计打卡任务打卡（**同一天只能成功一次**）。
+
+        返回 ``(是否写入成功, 给用户看的一句话)``。
+
+        为什么要返回一句话：失败原因有好几种（不是打卡任务、今天已经打过、已过截止日），
+        界面要原样告诉用户，不能默默什么都不做。
+
+        日期边界（避坑 #2）：``day`` 缺省时取**本地时间** ``date.today()``，
+        也就是自然日 00:00~23:59:59 —— 凌晨 00:10 打卡算新的一天，不会算到昨天。
+        """
+        task = self.get_task(int(task_id))
+        if task is None:
+            return False, "任务不存在"
+        if not task.is_cumulative:
+            return False, "这不是累计打卡任务"
+        stamp = now or datetime.now()
+        # 日期一律取**本地时间**的自然日：给了 now 就从 now 取（这样"凌晨 00:10 打卡算
+        # 新的一天"是可以被测试证明的），否则用 date.today()。不用 UTC，不四舍五入。
+        if isinstance(day, date):
+            target_day = day
+        elif day:
+            try:
+                target_day = datetime.strptime(str(day)[:10], "%Y-%m-%d").date()
+            except ValueError:
+                return False, f"日期格式不对：{day}"
+        else:
+            target_day = stamp.date()
+        if task.rule.is_expired(target_day):
+            return False, f"已过截止日期（{task.rule.deadline:%Y-%m-%d}），不能再打卡"
+        with self._lock:
+            try:
+                self._conn.execute(
+                    """
+                    INSERT INTO check_in_logs(task_id, checkin_date, checkin_at, note, source)
+                    VALUES(?, ?, ?, ?, ?)
+                    """,
+                    (int(task_id), target_day.strftime("%Y-%m-%d"),
+                     stamp.strftime(TS_FMT), (note or "")[:200], source or "manual"),
+                )
+                self._conn.commit()
+            except sqlite3.IntegrityError:
+                # UNIQUE(task_id, checkin_date) → 今天已经打过卡了
+                return False, f"{target_day:%m-%d} 已经打过卡了（同一天只能打一次）"
+            except sqlite3.Error as exc:
+                log.warning("打卡失败: %s", exc)
+                return False, "打卡失败（数据库错误，详见日志）"
+        total = self.checkin_count(task_id)
+        status = cumulative_status(task.rule, self.checkin_dates(task_id))
+        log.info("累计打卡：任务 #%s %s 打卡成功（%s/%s，%s）",
+                 task_id, target_day, total, status.target, status.state)
+        if status.finished:
+            return True, f"打卡成功！{status.progress_text()} —— {status.state_label}"
+        return True, f"打卡成功！{status.progress_text()}，还差 {status.remaining} 次"
+
+    def undo_check_in(self, task_id: int, day: date | str | None = None) -> bool:
+        """撤销某一天的打卡（点错了可以退回；也用于测试）。"""
+        key = day.strftime("%Y-%m-%d") if isinstance(day, date) else (
+            str(day)[:10] if day else date.today().strftime("%Y-%m-%d"))
+        with self._lock:
+            try:
+                cursor = self._conn.execute(
+                    "DELETE FROM check_in_logs WHERE task_id = ? AND checkin_date = ?",
+                    (int(task_id), key),
+                )
+                self._conn.commit()
+            except sqlite3.Error as exc:
+                log.warning("撤销打卡失败: %s", exc)
+                return False
+        removed = int(cursor.rowcount or 0) > 0
+        if removed:
+            log.info("累计打卡：任务 #%s 撤销了 %s 的打卡", task_id, key)
+        return removed
 
     # ------------------------------------------------------------------ 周期任务：发生记录
     def get_task_log(self, task_id: int, occur_date: date | str) -> TaskLog | None:
@@ -875,10 +1187,16 @@ class UsageStore:
                     time_start: str | None = None, time_end: str | None = None,
                     days_of_week: str | None = None,
                     remind_before_minutes: int | None = None,
+                    target_count: int | None = None,
+                    deadline: str | date | None = None,
+                    remind_time: str | None = None,
                     clear_due: bool = False) -> bool:
         """修改任务（只更新传入的字段）。
 
         :param clear_due: 把 ``due_at`` 置空（切换成周期任务时需要）
+        :param target_count: 累计打卡任务的目标次数
+        :param deadline: 累计打卡任务的截止日期
+        :param remind_time: 累计打卡任务的每日提醒时间
         """
         fields: list[str] = []
         values: list[object] = []
@@ -917,13 +1235,30 @@ class UsageStore:
             values.append(task_type)
             if task_type == TYPE_ONCE:
                 # 变回单次任务：清掉周期字段，避免语义混淆
+                fields += ["time_start = NULL", "time_end = NULL", "days_of_week = NULL",
+                           "target_count = NULL", "deadline = NULL", "remind_time = NULL"]
+            elif task_type == TYPE_CUMULATIVE:
+                # 改成累计打卡：周期字段必须清掉，否则会多出一份"假计划"，
+                # 让窗口判定 / 列表文案 / 统计口径全部对不上。
                 fields += ["time_start = NULL", "time_end = NULL", "days_of_week = NULL"]
+                time_start = time_end = days_of_week = None
+                existing_cum = self.get_task(int(task_id))
+                has_deadline = deadline not in (None, "") or (
+                    existing_cum is not None and existing_cum.rule.deadline is not None)
+                if not has_deadline:
+                    log.warning("改成累计打卡任务失败：没有截止日期")
+                    return False
             elif task_type == TYPE_DAILY:
                 fields.append("days_of_week = NULL")
                 # 关键：把入参也一并丢弃，否则下面那段通用的
                 # "if days_of_week is not None" 会紧接着再写一次，
                 # 把刚清掉的星期几**覆盖回去**（每周 → 每天 时必然发生）。
                 days_of_week = None
+            if task_type in (TYPE_DAILY, TYPE_WEEKLY):
+                # 从"累计打卡"改回周期任务：打卡字段必须清掉，
+                # 否则库里留着 target_count/deadline，界面和统计会各读一半。
+                fields += ["target_count = NULL", "deadline = NULL", "remind_time = NULL"]
+                target_count = deadline = remind_time = None
         if time_start is not None:
             fields.append("time_start = ?")
             values.append(format_hhmm(parse_hhmm(time_start, DEFAULT_START)))
@@ -940,6 +1275,25 @@ class UsageStore:
                 before = DEFAULT_REMIND_BEFORE
             fields.append("remind_before_minutes = ?")
             values.append(max(MIN_REMIND_BEFORE, min(MAX_REMIND_BEFORE, before)))
+
+        # ---- 累计打卡任务：目标次数 / 截止日期 / 每日提醒时间 ----
+        if target_count is not None:
+            try:
+                target = int(target_count)
+            except (TypeError, ValueError):
+                target = DEFAULT_TARGET_COUNT
+            fields.append("target_count = ?")
+            values.append(max(1, min(MAX_TARGET_COUNT, target)))
+        if deadline is not None:
+            deadline_date = _coerce_date(deadline)
+            if deadline_date is None:
+                log.warning("修改失败：截止日期无法解析（%r）", deadline)
+                return False
+            fields.append("deadline = ?")
+            values.append(deadline_date.strftime("%Y-%m-%d"))
+        if remind_time is not None:
+            fields.append("remind_time = ?")
+            values.append(format_hhmm(parse_hhmm(remind_time, DEFAULT_REMIND_TIME)))
 
         # ---- 生效起始日：改了"周期/时间段"就要重算 ----
         # 用户预期：把时间段改成"今天已经过去"的那种（比如晚上改成 06:00~08:00），
@@ -978,9 +1332,15 @@ class UsageStore:
         * **单次任务**：直接写 ``tasks.completed``（原有逻辑，行为不变）。
         * **周期任务**：改写**今天那一次**的发生记录（``task_logs``），
           绝不写 ``tasks.completed`` —— 否则"今天完成"会变成"永久完成"。
+        * **累计打卡任务**：这里直接拒绝。它的进度只认 ``check_in_logs``，
+          写成 ``tasks.completed`` 会把"打了 45 次卡"变成"任务永久完成"。
+          请改用 :meth:`check_in`。
         """
         task = self.get_task(int(task_id))
         if task is None:
+            return False
+        if task.is_cumulative:
+            log.warning("拒绝把累计打卡任务 #%s 标记为完成：请用 check_in()", task_id)
             return False
         if task.is_recurring:
             return self.complete_occurrence(task.id, date.today(), completed=completed)
@@ -1150,17 +1510,40 @@ class UsageStore:
                 recurring_overdue += 1
         recurring_pending = max(0, recurring_scheduled - recurring_done)
 
-        pending = (row["pending"] or 0) + recurring_pending
-        completed = (row["completed"] or 0) + recurring_done
+        # ---- 叠加累计打卡任务（今天维度）----
+        # 核心口径（用户诉求）：**截止日之前绝不进"已超期"**，只可能是
+        # "今天还没打卡"（pending + due_today）或"今天已打卡"（completed）。
+        # 这里只用两次批量查询（次数表 + 今天打过卡的任务集合），不做 N+1。
+        totals = self.checkin_counts()
+        checked_today = self.checkin_ids_on(day_date)
+        cumulative_pending = cumulative_done = cumulative_overdue = cumulative_due_today = 0
+        for task in self.cumulative_tasks():
+            target = max(1, int(task.rule.target_count or 1))
+            if int(totals.get(task.id, 0)) >= target:
+                # 已达成目标：不是"今天要做的事"，不计入今天的三项数字
+                # （否则"已完成"会天天 +1，跟周期任务当年那个 bug 一个味道）
+                continue
+            if task.rule.is_expired(day_date):
+                cumulative_pending += 1      # 仍然是未完成的待办
+                cumulative_overdue += 1      # 且只在过了截止日之后才计入超期
+                continue
+            if task.id in checked_today:
+                cumulative_done += 1
+            else:
+                cumulative_pending += 1
+                cumulative_due_today += 1    # 今天还没打卡 → 算"今天到期"
+
+        pending = (row["pending"] or 0) + recurring_pending + cumulative_pending
+        completed = (row["completed"] or 0) + recurring_done + cumulative_done
         return TaskCounts(
             # total 取 pending + completed，保证 TaskCounts 的不变式成立
             # （主界面显示"共 X 条 / 待办 Y / 已完成 Z"，三个数必须自洽）
             total=pending + completed,
             pending=pending,
             completed=completed,
-            overdue=int(row["overdue"] or 0) + recurring_overdue,
+            overdue=int(row["overdue"] or 0) + recurring_overdue + cumulative_overdue,
             # “今天到期”只统计还没完成的（已完成的今天到期任务不该继续提醒）
-            due_today=int(row["due_today"] or 0) + recurring_pending,
+            due_today=(int(row["due_today"] or 0) + recurring_pending + cumulative_due_today),
         )
 
     def task_stats_by_day(self, days: int = 7) -> list[TaskDayStat]:
@@ -1242,6 +1625,27 @@ class UsageStore:
                     window = task.occurrence_on(day_date)
                     if window is not None and window.end < now:
                         buckets[day]["overdue"] += 1
+
+        # ---- 叠加累计打卡任务的打卡记录（"累计打卡的完成情况"就看这里）----
+        # 每一次打卡都算一次"按时完成"（累计任务没有迟到一说：截止日之前哪天打都算），
+        # 逾期只在**截止日那一天**记一笔 —— 记在每一天会把图表刷成一片红，
+        # 而且是同一个失败被数了很多次。
+        first_day_date = datetime.strptime(first_day, "%Y-%m-%d").date()
+        today = now.date()
+        for log_row in self.checkin_logs_between(first_day_date, today):
+            bucket = buckets.get(log_row.checkin_date)
+            if bucket is not None:
+                bucket["on_time"] += 1
+        for task in self.cumulative_tasks():
+            deadline = task.rule.deadline
+            if deadline is None or deadline >= today:
+                continue                     # 还没到截止日 → 绝不记逾期
+            target = max(1, int(task.rule.target_count or 1))
+            if self.checkin_count(task.id) >= target:
+                continue                     # 已经达标（含压哨）
+            key = deadline.strftime("%Y-%m-%d")
+            if key in buckets:
+                buckets[key]["overdue"] += 1  # 只在截止日那天记一笔"没达标"
         return [TaskDayStat(day, **buckets[day]) for day in last_n_days(days)]
 
     def task_overview(self, days: int = 7) -> dict[str, int]:
@@ -1326,6 +1730,19 @@ class UsageStore:
             writer.writerow(["ID", "任务内容", "类型", "计划 / 截止", "创建时间",
                              "是否完成", "完成时间", "状态", "备注"])
             for task in tasks:
+                if task.is_cumulative:
+                    # 累计打卡任务：完成情况看 check_in_logs，"是否完成"用达成/未达成表达，
+                    # 并且**绝不**在截止日之前写"逾期"（用户的核心诉求）。
+                    status = cumulative_status(task.rule, self.checkin_dates(task.id))
+                    writer.writerow([
+                        task.id, task.title, task.type_label, task.rule.checkin_schedule_text(),
+                        task.created_at.strftime("%Y-%m-%d %H:%M"),
+                        "是" if status.finished else "否",
+                        status.reached_on.strftime("%Y-%m-%d") if status.reached_on else "",
+                        f"{status.state_label}：{status.progress_text()}，{status.countdown_text()}",
+                        task.note,
+                    ])
+                    continue
                 if task.is_recurring:
                     # 周期任务：完成情况按天记在 task_logs，不能在这一行里下结论
                     writer.writerow([
@@ -1362,6 +1779,21 @@ class UsageStore:
                     "是" if log_row.was_late else "",
                     log_row.remind_at.strftime("%Y-%m-%d %H:%M") if log_row.remind_at else "",
                     log_row.kind_label,
+                    log_row.note,
+                ])
+
+            writer.writerow([])
+            writer.writerow([f"【累计打卡记录】（最近 {days} 天）"])
+            writer.writerow(["日期", "任务", "类型", "打卡时间", "来源", "备注"])
+            for log_row in self.checkin_logs_between(
+                    datetime.strptime(start, "%Y-%m-%d").date(), date.today()):
+                task = title_by_id.get(log_row.task_id)
+                writer.writerow([
+                    log_row.checkin_date,
+                    task.title if task else f"(已删除的任务 #{log_row.task_id})",
+                    task.type_label if task else "",
+                    log_row.checkin_at.strftime("%Y-%m-%d %H:%M:%S") if log_row.checkin_at else "",
+                    log_row.source_label,
                     log_row.note,
                 ])
         return len(rows) + len(task_rows) + len(logs)

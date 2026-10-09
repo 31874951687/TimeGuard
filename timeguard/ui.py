@@ -1013,7 +1013,8 @@ class MainWindow:
             return
         try:
             RecurringReminderDialog(self.root, batch, font_family=self.font_family,
-                                    on_open_tasks=self.show_tasks_tab)
+                                    on_open_tasks=self.show_tasks_tab,
+                                    on_check_in=self.check_in_task)
         except Exception:  # noqa: BLE001
             log.exception("弹出周期任务提醒窗口失败")
             return
@@ -1023,6 +1024,41 @@ class MainWindow:
             self.task_panel.refresh()
         except Exception:  # noqa: BLE001
             log.debug("刷新待办列表失败", exc_info=True)
+
+    def check_in_task(self, task_id: int) -> tuple[bool, str]:
+        """给累计打卡任务打一次卡（弹窗按钮与待办列表按钮共用这一条路径）。
+
+        返回 ``(是否成功, 给用户看的一句话)`` —— 数据层已经把各种失败原因
+        （不是打卡任务 / 今天已经打过 / 已过截止日）写成中文，这里原样透传。
+        """
+        try:
+            ok, message = self.store.check_in(int(task_id))
+        except Exception as exc:  # noqa: BLE001
+            log.exception("打卡失败（任务 #%s）", task_id)
+            return False, f"打卡失败：{exc}"
+        if ok:
+            log.info("累计打卡：任务 #%s 打卡成功（%s）", task_id, message)
+        try:
+            self.task_panel.refresh()
+            self._update_tray_tooltip()
+        except Exception:  # noqa: BLE001
+            log.debug("打卡后刷新界面失败", exc_info=True)
+        # 打卡会改变"下一次提醒"（今天不再提醒），所以必须重排调度器
+        self.reschedule_recurring(reason="check-in")
+        return ok, message
+
+    def undo_check_in_task(self, task_id: int, day=None) -> tuple[bool, str]:
+        """撤销某一天的打卡（点错了用）。"""
+        try:
+            removed = self.store.undo_check_in(int(task_id), day)
+        except Exception as exc:  # noqa: BLE001
+            log.exception("撤销打卡失败（任务 #%s）", task_id)
+            return False, f"撤销失败：{exc}"
+        if not removed:
+            return False, "那一天没有打卡记录"
+        self.task_panel.refresh()
+        self.reschedule_recurring(reason="undo-check-in")
+        return True, "已撤销该次打卡"
 
     def test_recurring_reminder(self) -> None:
         """设置页「测试周期提醒」按钮：立刻派发当前到点的那批（没有则提示）。
