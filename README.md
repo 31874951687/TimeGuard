@@ -1,6 +1,7 @@
 # TimeGuard 时间管家 ⏳
 
 [![tests](https://github.com/31874951687/TimeGuard/actions/workflows/tests.yml/badge.svg)](https://github.com/31874951687/TimeGuard/actions/workflows/tests.yml)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 ![platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d4)
 ![python](https://img.shields.io/badge/python-3.11%20%7C%203.13%20%7C%203.14-3776ab)
 
@@ -889,3 +890,17 @@ Setting("game_processes", "监控的游戏 / 软件进程名", "监控对象", "
 | 开机提醒弹窗（v1.4） | `tools/e2e_startup_dialog.py`：17 项断言全通过 —— 大号 ✕（52×44px）能立刻关闭、倒计时从 5 秒递减、归零后自动关闭、同一天第二次启动不弹、换一天又能弹、托盘提示只发一次并写明"以后不再自动提示" |
 | 周期任务生效起始日（v1.4） | `tools/e2e_start_date.py`：14 项断言全通过（真实对话框建任务）—— 21 点建「每天 20:33~21:33」→ 生效日是明天、今天不排班、列表落「本周待办」且不是"已超期"、今日统计与 7 天图表都不记逾期、调度器下一次唤醒在明天；建「每天 21:48~22:48」（还没到）→ 生效日就是今天、正常进「今日待办」 |
 | GitHub Actions CI | 推上 GitHub 后自动跑（Python 3.11 + 3.13）：140 个单元测试 + `--selftest` + ruff 全部通过。**CI 上线第一天就抓出两个真问题**：① 用例里写死了 `2026-10-09`，到了这天"生效日晚于今天"不再成立，断言挂掉；② runner 是 en-US，stdout 走管道时用 cp1252 编码，脚本最后那行中文摘要抛 `UnicodeEncodeError` —— 测试全过但退出码 1。后者不只是 CI 问题：**任何英文系统的用户跑 `--selftest` 都会崩**。修法是新增 `utils.use_utf8_console()`（把 stdout/stderr 切到 UTF-8，`errors="replace"`），`main()` 与 4 个测试入口都调用 |
+
+---
+
+## 七、许可证
+
+[MIT](LICENSE) —— 随便用、随便改、可以商用，只要保留版权声明即可。
+
+```
+Copyright (c) 2026 31874951687
+```
+
+> 想换成别的（Apache-2.0 / GPL-3.0 / 保留所有权利）：直接替换根目录的 `LICENSE` 文件即可，
+> 同时把上面这行和 README 顶部的 license 徽章一起改掉。
+
