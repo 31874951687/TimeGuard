@@ -255,7 +255,7 @@ def main() -> int:
 
     def tab_settings() -> None:
         """设置页：抓总览图，再定位到「窗口大小」项抓预览控件。"""
-        window.notebook.select(2)
+        window.notebook.select(window.notebook_index_settings)
 
         def shot() -> None:
             grab("04_settings")
@@ -289,7 +289,7 @@ def main() -> int:
 
     def task_dialog() -> None:
         """打开「添加任务」对话框（验证日期时间选择器）。"""
-        window.notebook.select(1)
+        window.notebook.select(window.notebook_index_tasks)
         from timeguard.tasks import TaskDialog
         dialog = TaskDialog(window.root, font_family=window.font_family)
         window.root.after(1500, lambda: grab_dialog(dialog, "05_task_dialog"))

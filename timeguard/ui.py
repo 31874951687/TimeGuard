@@ -1,4 +1,4 @@
-"""主界面：深色主题的 tkinter 窗口（实时状态 / 统计图表 / 设置面板）+ 系统托盘。
+﻿"""主界面：深色主题的 tkinter 窗口（实时状态 / 统计图表 / 设置面板）+ 系统托盘。
 
 界面结构::
 
@@ -26,8 +26,9 @@ from datetime import datetime
 from tkinter import messagebox, ttk
 
 from . import notifier as notifier_mod
-from . import paths, phrases, winapi
+from . import autostart, paths, phrases, winapi
 from .chart import WeekChart, pick_cjk_font
+from .checkin_page import CheckinPage
 from .config import Config
 from .database import UsageStore
 from .engine import Snapshot, UsageEngine
@@ -434,6 +435,13 @@ class MainWindow:
         style.configure("Card.TCheckbutton", background=PANEL, foreground=FG, font=self.font_body)
         style.map("Card.TCheckbutton", background=[("active", PANEL)],
                   indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
+        # 标题栏里的"⚡ 开机自启"：背景要跟标题栏一致（BG），否则会露出一块 PANEL 色
+        style.configure("Header.TCheckbutton", background=BG, foreground=SUB,
+                        font=self.font_small, padding=(2, 2))
+        style.map("Header.TCheckbutton",
+                  background=[("active", BG)],
+                  foreground=[("selected", FG), ("!selected", SUB)],
+                  indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
         style.configure("Card.TRadiobutton", background=PANEL, foreground=FG, font=self.font_body)
         style.map("Card.TRadiobutton", background=[("active", PANEL)],
                   indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
@@ -470,13 +478,26 @@ class MainWindow:
         ttk.Label(header, text="⏳ TimeGuard 时间管家", style="Header.TLabel").grid(row=0, column=0, sticky="w")
         self.label_status = ttk.Label(header, text="正在初始化…", style="HeaderSub.TLabel")
         self.label_status.grid(row=0, column=1, sticky="w", padx=(14, 0))
+        # 开机自启快捷开关（v1.6）：设置页里本来就有这一项，但藏得深；
+        # 放在标题栏一眼可见，点一下即写入/删除注册表 Run 键（不需要管理员）。
+        # 用带文字的按钮而不是复选框：标题栏是 BG 底色，clam 主题的复选框指示器
+        # 会渲染成一个小黑块（实测很难看），按钮则与旁边的「暂停计时」完全一致。
+        self.var_autostart = tk.BooleanVar(value=autostart.is_enabled())
+        self.btn_autostart = ttk.Button(header, text=self._autostart_text(), style="Small.TButton",
+                                        command=self.toggle_autostart)
+        self.btn_autostart.grid(row=0, column=2, padx=(0, 10))
+        if not autostart.is_supported():
+            try:
+                self.btn_autostart.state(["disabled"])
+            except tk.TclError:
+                pass
         self.btn_pause = ttk.Button(header, text="⏸ 暂停计时", style="Small.TButton", command=self.toggle_pause)
-        self.btn_pause.grid(row=0, column=2, padx=(0, 6))
+        self.btn_pause.grid(row=0, column=3, padx=(0, 6))
         ttk.Button(header, text="🗕 最小化到托盘", style="Small.TButton",
                    command=lambda: self.hide_to_tray(manual=True)).grid(
-            row=0, column=3, padx=(0, 6)
+            row=0, column=4, padx=(0, 6)
         )
-        ttk.Button(header, text="✖ 退出", style="Small.TButton", command=self.quit_app).grid(row=0, column=4)
+        ttk.Button(header, text="✖ 退出", style="Small.TButton", command=self.quit_app).grid(row=0, column=5)
 
         # ---------- 今日概览卡片 ----------
         card = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
@@ -571,6 +592,26 @@ class MainWindow:
         notebook.add(tasks_page, text="✅ 待办任务")
         self.notebook_index_tasks = 1
 
+        # 打卡进度页（v1.6）：热力图与进度条**单独一页**
+        # 为什么不放在待办页下半屏：清单要"行多行小"，热力图要"格子大看得清"，
+        # 挤在一个下半屏里两边都变小（实测热力图只剩 8px 的方块、清单被压到两三行）。
+        checkin_page = ttk.Frame(notebook, style="Card.TFrame")
+        checkin_page.columnconfigure(0, weight=1)
+        checkin_page.rowconfigure(0, weight=1)
+        self.checkin_panel = CheckinPage(
+            checkin_page, self.store, font_family=self.font_family,
+            on_check_in=self.check_in_task,
+            on_undo=self.undo_check_in_task,
+            on_backfill=self.backfill_task,
+        )
+        self.checkin_panel.grid(row=0, column=0, sticky="nsew")
+        notebook.add(checkin_page, text="🔥 打卡进度")
+        self.notebook_index_checkin = 2
+        try:
+            self.checkin_panel.refresh()      # 启动就填一次，打开页面时不用等
+        except Exception:  # noqa: BLE001
+            log.debug("初始化打卡进度页失败", exc_info=True)
+
         # 设置页：数据驱动（左列表 + 右编辑器），不再用"画布塞满控件"的滚动方案。
         # 旧方案一次滚动要重绘上百个控件（实测 128~155ms/帧），快速滑动必有残影。
         settings_page = ttk.Frame(notebook, style="TFrame")
@@ -581,7 +622,7 @@ class MainWindow:
         # 向后兼容：旧代码/工具里用过 settings_scroll
         self.settings_scroll = self.settings_panel
         notebook.add(settings_page, text="⚙ 设置")
-        self.notebook_index_settings = 2
+        self.notebook_index_settings = 3
 
         # ---------- 底部提示条 ----------
         self.label_toast = tk.Label(
@@ -712,6 +753,7 @@ class MainWindow:
             # 待办倒计时每秒刷新（只在待办页可见时做，省 CPU）
             if self._tasks_tab_visible():
                 self.task_panel.tick()
+                self.checkin_panel.tick()
             self._auto_check_in_pass()
             self.popup_manager.pump()
             self._drain_tray_actions()
@@ -1043,6 +1085,103 @@ class MainWindow:
         """手动再查看一次待办提醒（托盘菜单 / 设置页按钮调用）。"""
         self.check_tasks_on_start()
 
+    # ------------------------------------------------------------------ 打卡进度页
+    def _autostart_text(self) -> str:
+        """标题栏开关的文案（把当前状态写出来，免得用户要猜）。"""
+        enabled = autostart.is_enabled() if autostart.is_supported() else False
+        return "⚡ 开机自启：开" if enabled else "⚡ 开机自启：关"
+
+    def toggle_autostart(self) -> None:
+        """标题栏的「⚡ 开机自启」：写/删注册表 Run 键，并同步设置页与配置文件。
+
+        注意 ``autostart.apply()`` 的返回值是**最终是否已开启**（不是"成功与否"）——
+        关掉自启时它返回 False，别把它当成失败（这里踩过一次）。
+        """
+        wanted = bool(self.var_autostart.get())
+        if not autostart.is_supported():
+            self.show_toast_message("当前系统不支持注册表开机自启", AMBER)
+            return
+        try:
+            autostart.apply(wanted)
+        except Exception:  # noqa: BLE001 - 注册表被策略锁住等
+            log.exception("切换开机自启失败")
+        actual = autostart.is_enabled() if autostart.is_supported() else False
+        try:
+            self.var_autostart.set(actual)
+            self.btn_autostart.configure(text=self._autostart_text())
+        except tk.TclError:
+            pass
+        # 不管成功失败都按真实状态落盘，避免配置与注册表对不上
+        self.config.settings.autostart_enabled = actual
+        try:
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            log.debug("保存开机自启设置失败", exc_info=True)
+        if actual == wanted:
+            log.info("开机自启已%s", "开启" if actual else "关闭")
+            self.show_toast_message(
+                "已开启开机自启（下次登录 Windows 时自动运行）" if actual else "已关闭开机自启"
+            )
+        else:
+            self.show_toast_message("开机自启切换失败（可能被系统策略限制），详见日志", AMBER)
+        # 设置页里那一行也要跟着变，否则同一个开关在两处显示不一致
+        try:
+            editor = getattr(self.settings_panel, "_rows", {}).get("autostart_enabled")
+            if editor is not None and hasattr(editor, "set"):
+                editor.set(actual)
+            self.settings_panel.refresh()
+        except Exception:  # noqa: BLE001
+            log.debug("同步设置页的开机自启状态失败", exc_info=True)
+
+    def show_checkin_tab(self, task_id: int | None = None) -> None:
+        """切到「🔥 打卡进度」页（可选：直接定位到某条打卡任务）。"""
+        try:
+            self.notebook.select(self.notebook_index_checkin)
+        except Exception:  # noqa: BLE001
+            log.debug("切换打卡进度页失败", exc_info=True)
+            return
+        try:
+            self.checkin_panel.refresh()
+            if task_id is not None:
+                self.checkin_panel.select_task(int(task_id))
+        except Exception:  # noqa: BLE001
+            log.debug("刷新打卡进度页失败", exc_info=True)
+
+    def backfill_task(self, task_id: int) -> tuple[bool, str]:
+        """给累计打卡任务补签（打卡页的「📝 补签…」按钮走这里）。"""
+        task = self.store.get_task(int(task_id))
+        if task is None:
+            return False, "任务不存在"
+        try:
+            from .tasks import BackfillDialog
+        except Exception:  # noqa: BLE001
+            log.exception("导入补签对话框失败")
+            return False, "补签功能不可用"
+        dialog = BackfillDialog(self.root, task, self.store, font_family=self.font_family)
+        self.root.wait_window(dialog)
+        if dialog.result is None:
+            return False, "已取消补签"
+        day, note = dialog.result
+        ok, message = self.store.check_in(task_id, day, note=note)
+        if ok:
+            self._after_checkin_changed(f"{task.title}：{message}")
+        return ok, message
+
+    def _after_checkin_changed(self, note: str = "") -> None:
+        """打卡 / 补签 / 撤销之后统一收尾：刷新两个页面、提示条、调度器。"""
+        for name in ("task_panel", "checkin_panel"):
+            panel = getattr(self, name, None)
+            if panel is None:
+                continue
+            try:
+                panel.refresh()
+            except Exception:  # noqa: BLE001
+                log.debug("刷新 %s 失败", name, exc_info=True)
+        self._update_tray_tooltip()
+        self.reschedule_recurring(reason="check-in")
+        if note:
+            self.show_toast_message(note)
+
     # ------------------------------------------------------------------ 周期任务提醒
     def start_task_scheduler(self) -> None:
         """启动周期任务调度器（界面出现后调用一次）。
@@ -1111,13 +1250,7 @@ class MainWindow:
             return False, f"打卡失败：{exc}"
         if ok:
             log.info("累计打卡：任务 #%s 打卡成功（%s）", task_id, message)
-        try:
-            self.task_panel.refresh()
-            self._update_tray_tooltip()
-        except Exception:  # noqa: BLE001
-            log.debug("打卡后刷新界面失败", exc_info=True)
-        # 打卡会改变"下一次提醒"（今天不再提醒），所以必须重排调度器
-        self.reschedule_recurring(reason="check-in")
+            self._after_checkin_changed()
         return ok, message
 
     def undo_check_in_task(self, task_id: int, day=None) -> tuple[bool, str]:
@@ -1129,8 +1262,7 @@ class MainWindow:
             return False, f"撤销失败：{exc}"
         if not removed:
             return False, "那一天没有打卡记录"
-        self.task_panel.refresh()
-        self.reschedule_recurring(reason="undo-check-in")
+        self._after_checkin_changed()
         return True, "已撤销该次打卡"
 
     def test_recurring_reminder(self) -> None:

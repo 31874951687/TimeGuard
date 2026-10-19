@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT))
 os.environ["TIMEGUARD_DATA_DIR"] = tempfile.mkdtemp(prefix="tg_e2e_cumulative_")
 os.environ.setdefault("TIMEGUARD_NO_TOAST", "1")   # 测试不发真实系统通知
 
+from timeguard import autostart  # noqa: E402
 from timeguard import recurrence as R  # noqa: E402
 from timeguard import winapi  # noqa: E402
 from timeguard.config import Config  # noqa: E402
@@ -245,15 +246,11 @@ def main() -> int:
               str([(s.day, s.on_time) for s in stats][-3:]))
         win.show_tasks_tab()                    # 先切到待办页，再截图（否则拍到的是统计页）
         pump(0.8)
-        # 选中打卡任务 → 下半窗格应换成"进度条 + 热力图"
         select_task(task.id)
         pump(0.8)
-        check("选中打卡任务后下半窗格换成打卡详情（图表让位）",
-              panel._detail_visible is True                              # noqa: SLF001
-              and panel.detail.status is not None
-              and "45/60" in getattr(panel.detail.progress, "text", ""),
-              f"detail_visible={panel._detail_visible} 进度条文字="       # noqa: SLF001
-              f"{getattr(panel.detail.progress, 'text', '（无）')!r}")
+        check("待办页下半屏仍是 7 天图表（进度/热力图已搬到独立页）",
+              panel.chart.winfo_ismapped() and not hasattr(panel, "detail"),
+              f"图表可见={panel.chart.winfo_ismapped()}")
         save_shot(win.root, "26_cumulative_panel")
 
         # ---------------------------------------------------------- 提醒
@@ -480,26 +477,87 @@ def main() -> int:
         pump(0.5)
         select_task(auto_task)
         pump(0.6)
+
+        # ---------------------------------------------------------- 独立页 + 开机自启（v1.6）
+        print("-- 8) 「🔥 打卡进度」独立页 + 开机自启开关 --")
+        tabs = [win.notebook.tab(i, "text") for i in range(win.notebook.index("end"))]
+        check("多了一个「🔥 打卡进度」独立页（热力图不再挤在待办页里）",
+              any("打卡进度" in text for text in tabs) and len(tabs) == 4, str(tabs))
+        check("索引正确：待办=1 / 打卡=2 / 设置=3",
+              (win.notebook_index_tasks, win.notebook_index_checkin,
+               win.notebook_index_settings) == (1, 2, 3),
+              f"{win.notebook_index_tasks}/{win.notebook_index_checkin}"
+              f"/{win.notebook_index_settings}")
+        check("待办页下半屏恢复成 7 天图表（详情面板已搬走）",
+              not hasattr(panel, "detail_frame"))
+
+        win.show_checkin_tab(auto_task)
+        pump(0.9)
+        page = win.checkin_panel
+        check("打卡页里选中了这条任务",
+              page._selected_id == auto_task and page.detail.task is not None  # noqa: SLF001
+              and page.detail.task.id == auto_task,
+              f"选中 {page._selected_id} / 详情标题 {page.detail.title_var.get()!r}")
         check("详情面板把自动打卡规则写在计划行里",
-              "自动打卡" in panel.detail.plan_var.get()
-              or "自动打卡" in panel.detail.status_var.get()
-              or "30 分钟" in panel.detail.plan_var.get(),
-              panel.detail.plan_var.get())
-        # 排版断言：详情面板最下面那行按钮不能被裁掉（实测短窗口下会只剩一条边）
-        # 用**屏幕绝对坐标**比较：按钮底边不能超过详情面板的底边
-        detail = panel.detail
-        btn_bottom = detail.backfill_button.winfo_rooty() + detail.backfill_button.winfo_height()
-        frame_bottom = panel.detail_frame.winfo_rooty() + panel.detail_frame.winfo_height()
-        check("详情面板的按钮行没被裁切（在可见区域内）",
-              detail.backfill_button.winfo_ismapped() and 0 < btn_bottom <= frame_bottom,
-              f"按钮底边 {btn_bottom} / 面板底边 {frame_bottom}"
-              f"（面板高 {panel.detail_frame.winfo_height()}px，"
-              f"需要 {detail.winfo_reqheight()}px）")
+              "自动打卡" in page.detail.plan_var.get(), page.detail.plan_var.get())
+        hm_items = len(page.detail.heatmap.canvas.find_all())
+        check("打卡页的热力图更大也更密（26 周 × 13px 格子）",
+              hm_items > 100 and page.detail.heatmap.weeks >= 20,
+              f"{hm_items} 个元素 / {page.detail.heatmap.weeks} 周")
+        # 排版断言：详情最下面那行按钮不能被裁掉（用屏幕绝对坐标比，别跟父控件比）
+        btn = page.detail.backfill_button
+        btn_bottom = btn.winfo_rooty() + btn.winfo_height()
+        frame_bottom = page.detail.winfo_rooty() + page.detail.winfo_height()
+        check("详情三个按钮都在可见区域内（打卡 / 撤销 / 补签）",
+              btn.winfo_ismapped() and 0 < btn_bottom <= frame_bottom,
+              f"按钮底边 {btn_bottom} / 面板底边 {frame_bottom}")
         check("进度条与热力图都画出来了",
-              detail.progress.winfo_ismapped() and detail.heatmap.winfo_ismapped()
-              and len(detail.heatmap.canvas.find_all()) > 0,
-              f"热力图元素 {len(detail.heatmap.canvas.find_all())} 个")
-        save_shot(win.root, "29_cumulative_auto")
+              page.detail.progress.winfo_ismapped() and page.detail.heatmap.winfo_ismapped(),
+              f"热力图元素 {hm_items} 个")
+        save_shot(win.root, "30_checkin_page")
+
+        # 待办页的跳转按钮
+        win.notebook.select(win.notebook_index_tasks)
+        pump(0.3)
+        panel.open_checkin_page()
+        pump(0.5)
+        check("待办页的「🔥 打卡进度」按钮能跳转",
+              win.notebook.index("current") == win.notebook_index_checkin,
+              str(win.notebook.index("current")))
+
+        # ---- 开机自启：标题栏开关（设置页同一项）----
+        check("标题栏有「⚡ 开机自启」开关",
+              hasattr(win, "btn_autostart") and win.btn_autostart.winfo_exists() == 1
+              and "开机自启" in win.btn_autostart.cget("text"),
+              win.btn_autostart.cget("text") if hasattr(win, "btn_autostart") else "—")
+        if not autostart.is_supported():
+            print("  [跳过] 本机不支持注册表自启")
+        else:
+            original = autostart.is_enabled()
+            try:
+                win.var_autostart.set(True)
+                win.toggle_autostart()
+                pump(0.3)
+                check("打开开关 → 注册表 Run 键真的写进去了",
+                      autostart.is_enabled() is True and win.var_autostart.get() is True
+                      and "：开" in win.btn_autostart.cget("text"),
+                      f"{autostart.status_text()} / 按钮={win.btn_autostart.cget('text')}")
+                check("配置文件 autostart_enabled 同步为 True",
+                      win.config.settings.autostart_enabled is True)
+                win.var_autostart.set(False)
+                win.toggle_autostart()
+                pump(0.3)
+                check("关掉开关 → 注册表项被删掉",
+                      autostart.is_enabled() is False
+                      and win.config.settings.autostart_enabled is False,
+                      autostart.status_text())
+            finally:
+                autostart.apply(original)      # 恢复用户原来的设置，别把自启留在测试值上
+                win.config.settings.autostart_enabled = original
+                win.config.save()
+                win.var_autostart.set(original)
+            check("测试结束后已恢复原来的自启状态", autostart.is_enabled() == original,
+                  autostart.status_text())
 
         finish(0)
 

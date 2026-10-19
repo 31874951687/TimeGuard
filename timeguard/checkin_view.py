@@ -399,7 +399,8 @@ class CumulativeDetail(ttk.Frame):
     UNDO_BG = "#2f3a52"
 
     def __init__(self, master: tk.Misc, font_family: str = "Microsoft YaHei UI",
-                 on_check_in=None, on_undo=None, on_backfill=None, **kwargs) -> None:
+                 on_check_in=None, on_undo=None, on_backfill=None,
+                 weeks: int = 18, cell: int = 8, gap: int = 2, **kwargs) -> None:
         kwargs.setdefault("style", STYLE_CARD)
         kwargs.setdefault("padding", (10, 3))
         super().__init__(master, **kwargs)
@@ -407,6 +408,8 @@ class CumulativeDetail(ttk.Frame):
         self.font_family = font_family
         self.font_body = (font_family, 10)
         self.font_small = (font_family, 9)
+        #: 热力图尺寸（"打卡进度"独立页用更大的格子，塞在待办页下半屏时用小格子）
+        self.weeks, self.cell, self.gap = weeks, cell, gap
         #: ``on_check_in(task_id) -> (bool, str)``：是否成功 + 给用户看的一句话
         self.on_check_in = on_check_in
         #: ``on_undo(task_id) -> (bool, str)``
@@ -439,8 +442,9 @@ class CumulativeDetail(ttk.Frame):
         self.progress = ProgressBar(self, width=420, height=16, bg=PANEL, font_family=self.font_family)
         self.progress.grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 2))
 
-        # 18 周 × 8px 格子：热力图整体 ~97px 高，塞得进 HEIGHT_HINT 的高度预算
-        self.heatmap = CheckinHeatmap(self, font_family=self.font_family, weeks=18, cell=8, gap=2)
+        # 格子尺寸可调：独立页给大格子（看得清），塞在待办页下半屏时给小格子
+        self.heatmap = CheckinHeatmap(self, font_family=self.font_family,
+                                      weeks=self.weeks, cell=self.cell, gap=self.gap)
         self.heatmap.grid(row=3, column=0, columnspan=2, sticky="w")
 
         self.hint_label = tk.Label(self, textvariable=self.hint_var, bg=PANEL, fg=SUB, anchor="w",
@@ -602,6 +606,10 @@ class CumulativeDetail(ttk.Frame):
             self._set_hint("已过截止日期", AMBER)
         else:
             self._set_hint("", SUB)
+
+    def set_hint(self, text: str, color: str = SUB) -> None:
+        """外部写提示行（打卡页在动作失败时用它说明原因）。"""
+        self._set_hint(text, color)
 
     def _set_hint(self, text: str, color: str = SUB) -> None:
         """写提示行（成功绿 / 失败琥珀）。"""

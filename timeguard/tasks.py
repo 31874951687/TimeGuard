@@ -1387,10 +1387,16 @@ class TaskPanel(ttk.Frame):
                    command=lambda: self.postpone_selected(60)).pack(side="left", padx=(6, 0))
         ttk.Button(actions, text="🗑 删除", style="Danger.TButton",
                    command=self.delete_selected).pack(side="left", padx=(6, 0))
+        # 跳到独立页看进度条 + 热力图（选中打卡任务时直接定位到它）
+        self.btn_checkin_page = ttk.Button(actions, text="🔥 打卡进度", style="Small.TButton",
+                                           command=self.open_checkin_page)
+        self.btn_checkin_page.pack(side="left", padx=(6, 0))
         ttk.Label(actions, text="提示：双击分组折叠，双击任务编辑，右键更多操作",
                   style="CardHint.TLabel").pack(side="right")
 
         # ---- 图表（放在下半窗格，可拖拽调整高度）----
+        # v1.6 起下半屏**固定给 7 天图表**：打卡任务的进度条与热力图搬到了独立的
+        # 「🔥 打卡进度」页（用户要求 —— 两边挤在一个下半屏里都会变得很小）。
         self.chart_frame = ttk.Frame(self.paned, style="Card.TFrame")
         self.chart = TaskStatsChart(self.chart_frame, self.store, font_family=self.font_family)
         ttk.Label(self.chart_frame, textvariable=self.chart.summary_var,
@@ -1398,24 +1404,6 @@ class TaskPanel(ttk.Frame):
         self.chart.pack(fill="both", expand=True, pady=(2, 0))
         self.paned.add(self.chart_frame, weight=6)    # 下：完成情况图表
         self.paned.bind("<Configure>", self._set_initial_sash, add="+")
-
-        # ---- 累计打卡任务详情（进度条 + 打卡热力图）----
-        # 与图表**共用**下半窗格：选中打卡任务时把图表换成打卡详情，切回其它任务再换回来。
-        # 不用"图表 + 详情"上下叠着放，是因为可用高度只有 ~700px，
-        # 再塞 200px 会把任务列表压到只剩两行。
-        #
-        # 注意这里**延迟导入**：checkin_view 要用本模块的配色常量（ACCENT/PANEL 等），
-        # 模块级互相 import 会变成循环导入（实测 ImportError: partially initialized module）。
-        # 真正干净的解法是把配色抽到独立的 theme 模块，留待后续重构。
-        from .checkin_view import CumulativeDetail      # noqa: PLC0415
-        self.detail_frame = ttk.Frame(self.paned, style="Card.TFrame")
-        self.detail = CumulativeDetail(
-            self.detail_frame, font_family=self.font_family,
-            on_check_in=self._detail_check_in, on_undo=self._detail_undo,
-            on_backfill=self._detail_backfill,
-        )
-        self.detail.pack(fill="both", expand=True)
-        self._detail_visible = False
 
         # 右键菜单（周期任务不能"延后"，选中周期任务时这几项会被禁用）
         self.context_menu = tk.Menu(self, tearoff=0, bg=PANEL_ALT, fg=FG,
@@ -1543,90 +1531,8 @@ class TaskPanel(ttk.Frame):
         except tk.TclError:
             log.debug("同步打卡按钮失败", exc_info=True)
 
-    def _sync_detail(self, row: TaskRow | None) -> None:
-        """选中的是打卡任务 → 下半窗格显示进度条 + 热力图；否则换回 7 天图表。"""
-        want_detail = bool(row is not None and row.is_cumulative)
-        if want_detail == getattr(self, "_detail_visible", False):
-            if want_detail and row is not None:
-                self._fill_detail(row)          # 已经显示着：只更新内容（打卡后要刷新）
-            return
-        try:
-            if want_detail:
-                self.paned.forget(self.chart_frame)
-                self.paned.add(self.detail_frame, weight=6)
-                # 刚 add 进去时 paned 的高度还是旧值（布局没落定），
-                # 所以先试一次，再 after_idle 校正一次 —— 否则算出来的
-                # "还差多少像素"是错的，最下面那行按钮就留在可视区外了。
-                self._ensure_detail_height()
-                self.after_idle(self._ensure_detail_height)
-            else:
-                self.paned.forget(self.detail_frame)
-                self.paned.add(self.chart_frame, weight=6)
-            self._detail_visible = want_detail
-        except tk.TclError:
-            log.debug("切换下半窗格失败", exc_info=True)
-            return
-        if want_detail and row is not None:
-            self._fill_detail(row)
-        else:
-            try:
-                self.detail.clear()
-            except tk.TclError:
-                log.debug("清空打卡详情失败", exc_info=True)
-
-    def _ensure_detail_height(self) -> None:
-        """给打卡详情面板腾出它**自己要求**的高度（不够就把分隔条往下推）。
-
-        为什么不写死一个常数：详情面板的高度取决于字体缩放（133% 缩放下实测 201px），
-        写死 205 在别的缩放下就会把最下面那行按钮裁掉。这里直接问控件要
-        ``winfo_reqheight()``，再留 8px 余量，并且给列表保底 90px。
-        """
-        try:
-            self.update_idletasks()       # 先让布局落定，否则量到的高度是旧值
-            needed = max(180, min(300, int(self.detail.winfo_reqheight()) + 8))
-            height = self.paned.winfo_height()
-            if height < 220:
-                return                    # 窗口太矮：两边都放不下，交给用户自己拖
-            sash = self.paned.sashpos(0)
-            if height - sash >= needed:
-                return
-            self.paned.sashpos(0, max(90, height - needed))
-            log.debug("打卡详情需要 %dpx，已把分隔条推到 %d", needed, self.paned.sashpos(0))
-        except tk.TclError:
-            log.debug("调整打卡详情高度失败", exc_info=True)
-
-    def _fill_detail(self, row: TaskRow) -> None:
-        """把选中打卡任务的进度与历史喂给详情组件。"""
-        status = row.checkin
-        if status is None:
-            status = cumulative_status(row.task.rule, self.store.checkin_dates(row.task.id))
-        try:
-            self.detail.show_task(row.task, status)
-            self.detail.set_checked_days(self.store.checkin_dates(row.task.id))
-        except tk.TclError:
-            log.debug("刷新打卡详情失败", exc_info=True)
-
-    def _detail_check_in(self, task_id: int) -> tuple[bool, str]:
-        """详情面板里的「✓ 打卡」——和列表按钮走同一条路径。"""
-        return self._do_check_in(task_id)
-
-    def _detail_backfill(self, task_id: int) -> tuple[bool, str]:
-        """详情面板里的「📝 补签…」：选日期 + 写备注，然后交给数据层判定。"""
-        task = self.store.get_task(task_id)
-        if task is None:
-            return False, "任务不存在"
-        dialog = BackfillDialog(self, task, self.store, font_family=self.font_family)
-        self.wait_window(dialog)
-        if dialog.result is None:
-            return False, "已取消补签"
-        day, note = dialog.result
-        ok, message = self.store.check_in(task_id, day, note=note)
-        if ok:
-            self.refresh()
-            self._reschedule_tasks()
-            self._notify_app(f"{task.title}：{message}")
-        return ok, message
-
+    # v1.6：进度条与热力图搬到了独立的「🔥 打卡进度」页（checkin_page.py），
+    # 待办页下半屏固定显示 7 天图表。这里只保留补签入口（右键菜单用）。
     def backfill_selected(self) -> None:
         """右键菜单里的「📝 补签」：对选中的打卡任务补签。"""
         row = self._require_row()
@@ -1635,32 +1541,40 @@ class TaskPanel(ttk.Frame):
         if not row.is_cumulative:
             messagebox.showinfo("提示", f"「{row.task.title}」不是累计打卡任务。", parent=self)
             return
-        ok, message = self._detail_backfill(row.task.id)
-        if not ok and message != "已取消补签":
+        task = row.task
+        dialog = BackfillDialog(self, task, self.store, font_family=self.font_family)
+        self.wait_window(dialog)
+        if dialog.result is None:
+            return
+        day, note = dialog.result
+        ok, message = self.store.check_in(task.id, day, note=note)
+        if ok:
+            self.refresh()
+            self._reschedule_tasks()
+            self._notify_app(f"{task.title}：{message}")
+        else:
             messagebox.showinfo("提示", message, parent=self)
 
-    def _detail_undo(self, task_id: int) -> tuple[bool, str]:
-        """详情面板里的「撤销今日打卡」。"""
-        today = datetime.now().date()
-        if not self.store.undo_check_in(task_id, today):
-            return False, "今天没有打卡记录"
-        self.refresh()
-        self._reschedule_tasks()
-        return True, "已撤销今天的打卡"
-
     def _do_check_in(self, task_id: int) -> tuple[bool, str]:
-        """打卡并刷新界面（列表 + 详情 + 调度器）。"""
+        """打卡并刷新列表（托盘/右键路径用；进度页走 MainWindow.check_in_task）。"""
         ok, message = self.store.check_in(task_id)
         if ok:
             self.refresh()
             self._reschedule_tasks()
         return ok, message
 
+    def open_checkin_page(self) -> None:
+        """跳到「🔥 打卡进度」页（选中了打卡任务就定位到它）。"""
+        row = self.selected_row()
+        task_id = row.task.id if (row is not None and row.is_cumulative) else None
+        opener = getattr(self.app, "show_checkin_tab", None)
+        if callable(opener):
+            opener(task_id)
+
     def _update_hint(self) -> None:
         """提示条：选中行的详细信息（没选中就显示今日总览）。"""
         row = self.selected_row()
         self._sync_checkin_button(row)
-        self._sync_detail(row)
         if row is None:
             counts = self.store.task_counts()
             text = f"待办 {counts.pending} 条"

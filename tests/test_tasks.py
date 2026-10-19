@@ -692,7 +692,10 @@ def test_export_csv_includes_recurring_rules_and_checkins() -> None:
     import csv as _csv
 
     store = _store()
-    now = _fixed_now()
+    # 用**真实当前时间**：这个用例要断言"最近 7 天"的打卡记录进 CSV，
+    # 用固定日期会在真实时间走远之后掉出窗口（实测：写死 2026-10-07，
+    # 到了 10-19 之后那两条记录就不在"最近 7 天"里了，`total >= 4` 直接挂）。
+    now = datetime.now()
     # 单次任务的"状态"是按**真实当前时间**算的，所以截止时间要用真实时间往后推
     single_id = store.add_task("交周报", datetime.now() + timedelta(hours=2))
     daily_id = store.add_task("每天跑步", task_type="daily",
