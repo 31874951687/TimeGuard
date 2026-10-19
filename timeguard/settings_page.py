@@ -698,6 +698,9 @@ class SettingsPage(ttk.Frame):
                 ("📤 导出 CSV", self.app.export_csv),
                 ("📁 打开数据目录", self.app.open_data_dir),
                 ("☀ 待办提醒预览", self.app.show_task_reminder_again),
+                # 顶栏的「退出」按钮在 v1.7.1 去掉了（用户要求顶栏只留状态+暂停），
+                # 这里给一个兜底入口：窗口 ✕ 与托盘右键仍是主要退出方式。
+                ("🚪 退出程序", self.app.quit_app),
             ]
         if key == "__notifier__":
             # 纯展示项：说明当前后端，外加一个"发一条测试通知"的按钮方便排错

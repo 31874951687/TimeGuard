@@ -26,7 +26,7 @@ from datetime import datetime
 from tkinter import messagebox, ttk
 
 from . import notifier as notifier_mod
-from . import autostart, paths, phrases, winapi
+from . import paths, phrases, winapi
 from .chart import WeekChart, pick_cjk_font
 from .checkin_page import CheckinPage
 from .donut import DonutPanel
@@ -379,6 +379,11 @@ class MainWindow:
 
     def _setup_style(self) -> None:
         """配置 ttk 深色主题（基于 clam，可自定义颜色）。"""
+        # ---- 全局深色表格样式（v1.7.1 修）----
+        # 所有 ttk.Treeview 都不传 style，全靠这一份全局样式：待办列表、打卡进度页、
+        # 设置页三处表格都吃它。**必须在创建任何 Treeview 之前调用** ——
+        # v1.7 曾把唯一调用点随统计页明细表一起删掉，结果三处表格全退回 ttk 默认白底，
+        # 用户当场截图指出"跟整体风格不符"。所以现在钉在样式初始化里。
         style = ttk.Style(self.root)
         try:
             style.theme_use("clam")
@@ -437,13 +442,6 @@ class MainWindow:
         style.configure("Card.TCheckbutton", background=PANEL, foreground=FG, font=self.font_body)
         style.map("Card.TCheckbutton", background=[("active", PANEL)],
                   indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
-        # 标题栏里的"⚡ 开机自启"：背景要跟标题栏一致（BG），否则会露出一块 PANEL 色
-        style.configure("Header.TCheckbutton", background=BG, foreground=SUB,
-                        font=self.font_small, padding=(2, 2))
-        style.map("Header.TCheckbutton",
-                  background=[("active", BG)],
-                  foreground=[("selected", FG), ("!selected", SUB)],
-                  indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
         style.configure("Card.TRadiobutton", background=PANEL, foreground=FG, font=self.font_body)
         style.map("Card.TRadiobutton", background=[("active", PANEL)],
                   indicatorcolor=[("selected", ACCENT), ("!selected", PANEL_ALT)])
@@ -478,28 +476,30 @@ class MainWindow:
         header.grid(row=0, column=0, sticky="ew")
         header.columnconfigure(1, weight=1)
         ttk.Label(header, text="⏳ TimeGuard 时间管家", style="Header.TLabel").grid(row=0, column=0, sticky="w")
-        self.label_status = ttk.Label(header, text="正在初始化…", style="HeaderSub.TLabel")
-        self.label_status.grid(row=0, column=1, sticky="w", padx=(14, 0))
-        # 开机自启快捷开关（v1.6）：设置页里本来就有这一项，但藏得深；
-        # 放在标题栏一眼可见，点一下即写入/删除注册表 Run 键（不需要管理员）。
-        # 用带文字的按钮而不是复选框：标题栏是 BG 底色，clam 主题的复选框指示器
-        # 会渲染成一个小黑块（实测很难看），按钮则与旁边的「暂停计时」完全一致。
-        self.var_autostart = tk.BooleanVar(value=autostart.is_enabled())
-        self.btn_autostart = ttk.Button(header, text=self._autostart_text(), style="Small.TButton",
-                                        command=self.toggle_autostart)
-        self.btn_autostart.grid(row=0, column=2, padx=(0, 10))
-        if not autostart.is_supported():
-            try:
-                self.btn_autostart.state(["disabled"])
-            except tk.TclError:
-                pass
-        self.btn_pause = ttk.Button(header, text="⏸ 暂停计时", style="Small.TButton", command=self.toggle_pause)
-        self.btn_pause.grid(row=0, column=3, padx=(0, 6))
-        ttk.Button(header, text="🗕 最小化到托盘", style="Small.TButton",
-                   command=lambda: self.hide_to_tray(manual=True)).grid(
-            row=0, column=4, padx=(0, 6)
-        )
-        ttk.Button(header, text="✖ 退出", style="Small.TButton", command=self.quit_app).grid(row=0, column=5)
+        # 「● 监控中 · 暂停计时」必须是**一组**：放进同一个容器靠左排，
+        # 否则 header 的伸缩列会把暂停字样推到窗口最右边，和状态文字隔着半个屏幕。
+        status_group = tk.Frame(header, bg=BG)
+        status_group.grid(row=0, column=1, sticky="w", padx=(14, 0))
+        self.label_status = ttk.Label(status_group, text="正在初始化…", style="HeaderSub.TLabel")
+        self.label_status.pack(side="left")
+
+        # ---- 顶栏只剩「状态 + 暂停」这一组（v1.7.1，用户要求）----
+        # 原来的 ⚡开机自启 / 🗕最小化到托盘 / ✖退出 三个按钮全部去掉：
+        #   * 开机自启 → 设置页「界面与启动」那一行（本来就有）
+        #   * 最小化到托盘 → 窗口的系统最小化按钮（已有：最小化即隐藏到托盘）
+        #   * 退出 → 窗口 ✕（真退出）+ 托盘右键「退出」+ 设置页「常用操作 → 退出程序」
+        # 暂停做成**文字式**可点字样，字号/字体与「● 监控中」完全一致，
+        # 中间用「·」分隔，鼠标移上去才变亮。
+        tk.Label(status_group, text="·", bg=BG, fg=PANEL_ALT, font=self.font_small).pack(
+            side="left", padx=(7, 7))
+        self.label_pause = tk.Label(
+            status_group, text="暂停计时", bg=BG, fg=SUB, font=self.font_small,
+            cursor="hand2", padx=0, pady=0)
+        self.label_pause.pack(side="left")
+        self.label_pause.bind("<Button-1>", lambda _e: self.toggle_pause())
+        self.label_pause.bind("<Enter>", lambda _e: self.label_pause.configure(fg=FG))
+        self.label_pause.bind("<Leave>", lambda _e: self._restyle_pause())
+        self._restyle_pause()
 
         # ---------- 今日概览卡片 ----------
         card = ttk.Frame(outer, style="Card.TFrame", padding=(14, 10))
@@ -644,8 +644,16 @@ class MainWindow:
         )
         self.label_toast.grid(row=3, column=0, sticky="ew", pady=(8, 0))
 
-    def _style_tree(self) -> None:
-        """Treeview 深色样式（行高随 DPI 放大，表格更易读）。"""
+        # 表格深色样式：**必须放在 theme_use("clam") 之后**（换主题会把已配置的样式清掉），
+        # 同时早于任何 ttk.Treeview 的创建（三处表格都继承这份全局样式）。
+        self._apply_tree_style()
+
+    def _apply_tree_style(self) -> None:
+        """所有表格共用的深色样式（行高随 DPI 放大，表格更易读）。
+
+        注意：这是**全局** ttk 样式，改它会影响待办列表 / 打卡进度 / 设置页
+        三处表格 —— 这正是我们想要的（三处必须长得一样）。
+        """
         style = ttk.Style(self.root)
         style.configure("Treeview", background=PANEL_ALT, fieldbackground=PANEL_ALT, foreground=FG,
                         rowheight=int(30 * min(self.scale, 1.4)), borderwidth=0, font=self.font_body)
@@ -838,11 +846,14 @@ class MainWindow:
         # 顶部状态栏只留**实时状态**（v1.7，用户要求）：
         # 上限 / 提醒间隔 / 计时模式 / 通知后端 都是配置或诊断信息，
         # 顶栏常驻展示既重复（设置页、计时卡片里都有）又占地方。
+        # 暂停时以 engine.paused 为准：快照偶尔滞后半秒，但"暂停中"却显示"监控中"
+        # 就是自相矛盾了（状态不许说谎）。
+        monitoring = bool(snapshot.monitoring) and not bool(getattr(self.engine, "paused", False))
         self.label_status.configure(
-            text="● 监控中" if snapshot.monitoring else "○ 已暂停",
-            foreground=GREEN if snapshot.monitoring else AMBER,
+            text="● 监控中" if monitoring else "○ 已暂停",
+            foreground=GREEN if monitoring else AMBER,
         )
-        self.btn_pause.configure(text="▶ 继续计时" if self.engine.paused else "⏸ 暂停计时")
+        self._restyle_pause()
 
     def _on_tab_changed(self, _event=None) -> None:
         """切换标签页后补齐该页的数据（环图/图表都只在可见时算）。"""
@@ -894,6 +905,20 @@ class MainWindow:
             self.today_detail.refresh(self.store.today_targets())
         except Exception:  # noqa: BLE001
             log.debug("展开今日明细时刷新失败", exc_info=True)
+
+    def _restyle_pause(self) -> None:
+        """按引擎状态刷新「暂停计时 / 继续计时」字样与配色。
+
+        文字式控件（不是按钮）所以要自己管颜色：暂停中 → 琥珀色「继续计时」，
+        计时中 → 次要色「暂停计时」；鼠标悬停由 bind 单独提亮。
+        """
+        try:
+            paused = bool(getattr(self.engine, "paused", False))
+            self.label_pause.configure(
+                text="继续计时" if paused else "暂停计时",
+                fg=(AMBER if paused else SUB))
+        except tk.TclError:
+            log.debug("刷新暂停字样失败", exc_info=True)
 
     def _refresh_tree(self) -> None:
         """刷新计时卡片里的「今日各对象明细」折叠条 + 统计页的对象占比环图。
@@ -1162,53 +1187,6 @@ class MainWindow:
         self.check_tasks_on_start()
 
     # ------------------------------------------------------------------ 打卡进度页
-    def _autostart_text(self) -> str:
-        """标题栏开关的文案（把当前状态写出来，免得用户要猜）。"""
-        enabled = autostart.is_enabled() if autostart.is_supported() else False
-        return "⚡ 开机自启：开" if enabled else "⚡ 开机自启：关"
-
-    def toggle_autostart(self) -> None:
-        """标题栏的「⚡ 开机自启」：写/删注册表 Run 键，并同步设置页与配置文件。
-
-        注意 ``autostart.apply()`` 的返回值是**最终是否已开启**（不是"成功与否"）——
-        关掉自启时它返回 False，别把它当成失败（这里踩过一次）。
-        """
-        wanted = bool(self.var_autostart.get())
-        if not autostart.is_supported():
-            self.show_toast_message("当前系统不支持注册表开机自启", AMBER)
-            return
-        try:
-            autostart.apply(wanted)
-        except Exception:  # noqa: BLE001 - 注册表被策略锁住等
-            log.exception("切换开机自启失败")
-        actual = autostart.is_enabled() if autostart.is_supported() else False
-        try:
-            self.var_autostart.set(actual)
-            self.btn_autostart.configure(text=self._autostart_text())
-        except tk.TclError:
-            pass
-        # 不管成功失败都按真实状态落盘，避免配置与注册表对不上
-        self.config.settings.autostart_enabled = actual
-        try:
-            self.config.save()
-        except Exception:  # noqa: BLE001
-            log.debug("保存开机自启设置失败", exc_info=True)
-        if actual == wanted:
-            log.info("开机自启已%s", "开启" if actual else "关闭")
-            self.show_toast_message(
-                "已开启开机自启（下次登录 Windows 时自动运行）" if actual else "已关闭开机自启"
-            )
-        else:
-            self.show_toast_message("开机自启切换失败（可能被系统策略限制），详见日志", AMBER)
-        # 设置页里那一行也要跟着变，否则同一个开关在两处显示不一致
-        try:
-            editor = getattr(self.settings_panel, "_rows", {}).get("autostart_enabled")
-            if editor is not None and hasattr(editor, "set"):
-                editor.set(actual)
-            self.settings_panel.refresh()
-        except Exception:  # noqa: BLE001
-            log.debug("同步设置页的开机自启状态失败", exc_info=True)
-
     def show_checkin_tab(self, task_id: int | None = None) -> None:
         """切到「🔥 打卡进度」页（可选：直接定位到某条打卡任务）。"""
         try:
@@ -1368,8 +1346,9 @@ class MainWindow:
         self.popup_manager.request(title, message, detail, cooldown=cooldown)
 
     def toggle_pause(self) -> None:
-        """暂停 / 继续计时。"""
+        """暂停 / 继续计时（顶栏的「暂停计时」字样、托盘菜单都走这里）。"""
         paused = self.engine.toggle_pause()
+        self._restyle_pause()          # 立刻反色，别等下一次每秒刷新
         self.show_toast_message("已暂停计时" if paused else "已继续计时")
 
     def test_reminder(self) -> None:

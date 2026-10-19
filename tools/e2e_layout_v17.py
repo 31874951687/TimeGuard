@@ -159,6 +159,42 @@ def main() -> int:
             window.snapshot = fake_snapshot()
             window._refresh_status()      # noqa: SLF001
 
+            window.snapshot = fake_snapshot()
+            window._refresh_status()      # noqa: SLF001
+
+            # ---- 顶栏已无按钮（v1.7.1：用户要求只留「暂停计时」，且与状态文字成一组）
+            print("-- 1b) 顶栏只剩「状态 · 暂停计时」一组 --")
+            header_bar = window.label_pause.master.master
+            buttons = [w for w in header_bar.winfo_children()
+                       if w.winfo_class() in ("TButton", "Button")]
+            check("顶栏不再有任何按钮（开自启/托盘/退出都挪走了）", not buttons,
+                  str([getattr(w, "cget", lambda _k: "")("text") for w in buttons]))
+            check("「暂停计时」与「● 监控中」在同一个容器里（真的贴在一起）",
+                  window.label_pause.master is window.label_status.master,
+                  f"{window.label_pause.master} vs {window.label_status.master}")
+            check("两者字号一致（同一行同一高度）",
+                  abs(window.label_pause.winfo_reqheight()
+                      - window.label_status.winfo_reqheight()) <= 2,
+                  f"{window.label_pause.winfo_reqheight()} vs "
+                  f"{window.label_status.winfo_reqheight()}")
+            check("默认显示「暂停计时」", window.label_pause.cget("text") == "暂停计时",
+                  window.label_pause.cget("text"))
+            window.label_pause.event_generate("<Button-1>")     # 真的点一下
+            window._refresh_status()                            # noqa: SLF001
+            pump(window.root, 0.3)
+            check("点「暂停计时」→ 变「继续计时」且状态变「○ 已暂停」",
+                  window.label_pause.cget("text") == "继续计时"
+                  and window.label_status.cget("text") == "○ 已暂停"
+                  and window.engine.paused is True,
+                  f"{window.label_status.cget('text')} / {window.label_pause.cget('text')}")
+            window.label_pause.event_generate("<Button-1>")     # 再点回去
+            window._refresh_status()                            # noqa: SLF001
+            pump(window.root, 0.3)
+            check("再点一下恢复计时",
+                  window.label_pause.cget("text") == "暂停计时"
+                  and window.engine.paused is False,
+                  f"{window.label_status.cget('text')} / {window.label_pause.cget('text')}")
+
             # ------------------------------------------------ 2) 计时口径胶囊
             print("-- 2) 合并计时胶囊（就在计时旁边，点了即切换）--")
             pill = window.btn_count_mode
@@ -222,6 +258,27 @@ def main() -> int:
             check("汇总句指出占比最多的对象",
                   "哔哩哔哩动画" in summary and "共 4 个对象" in summary, summary)
             shot(window.root, "33_stats_v17_donut")
+
+            # ------------------------------------------------ 4b) 三处表格统一深色
+            print("-- 4b) 待办 / 打卡进度 / 设置 三处表格必须是深色 --")
+            from tkinter import ttk as _ttk
+
+            style = _ttk.Style(window.root)
+            bg = str(style.lookup("Treeview", "background") or "").lower()
+            field = str(style.lookup("Treeview", "fieldbackground") or "").lower()
+            head = str(style.lookup("Treeview.Heading", "background") or "").lower()
+            check("Treeview 背景是深色卡片色（不是 ttk 默认白底）",
+                  bg in ("#232b3d", "#1b2130") and field == bg, f"bg={bg} field={field}")
+            check("表头背景也是深色", head == "#1b2130", f"head={head}")
+            check("行高随 DPI 放大（>=24px）",
+                  int(style.lookup("Treeview", "rowheight") or 0) >= 24,
+                  str(style.lookup("Treeview", "rowheight")))
+            for label, tree in (("待办任务", window.task_panel.tree),
+                                ("打卡进度", window.checkin_panel.tree),
+                                ("设置页", window.settings_panel.tree)):
+                check(f"{label}的表格用同一份全局深色样式",
+                      str(tree.cget("style") or "Treeview") == "Treeview",
+                      str(tree.cget("style") or "(默认)"))
 
             # ------------------------------------------------ 5) 通知后端搬家
             print("-- 5) 通知后端从顶栏搬到设置页 --")

@@ -168,7 +168,13 @@ def test_overdue_and_late_detection() -> None:
 def test_due_text_labels() -> None:
     store = _store()
     now = datetime.now().replace(second=0, microsecond=0)
-    today_id = store.add_task("今天", now + timedelta(hours=1))
+    # "今天还没到"的窗口只在午夜前几分钟里才存在：这时跳过（否则 +1 小时会跨到明天，
+    # 在 23 点之后跑测试必挂 —— 实测 23:02 跑就红了）
+    if now.hour == 23 and now.minute >= 50:
+        print("  [跳过] 已接近午夜，构造不出『今天还未到』的时刻")
+        store.close()
+        return
+    today_id = store.add_task("今天", now + timedelta(minutes=5))
     tomorrow_id = store.add_task("明天", (now + timedelta(days=1)).replace(hour=9))
     task_today = store.get_task(today_id)
     task_tomorrow = store.get_task(tomorrow_id)
@@ -194,8 +200,14 @@ def test_remaining_seconds() -> None:
 def test_task_counts() -> None:
     store = _store()
     now = datetime.now()
-    store.add_task("超期未完成", now - timedelta(hours=3))
-    store.add_task("今天到期", now + timedelta(hours=2))
+    # 两条都必须落在**今天**：用 ±几分钟而不是 ±几小时，否则 23 点后跑会跨到明天，
+    # due_today 断言必挂（实测 23:02 跑红过一次）
+    if now.hour == 0 and now.minute < 5:
+        print("  [跳过] 刚过零点，构造不出『今天内已超期』的时刻")
+        store.close()
+        return
+    store.add_task("超期未完成", now - timedelta(minutes=5))
+    store.add_task("今天到期", now + timedelta(minutes=5))
     store.add_task("无期限")
     done_id = store.add_task("已完成", now + timedelta(hours=1))
     store.complete_task(done_id, True)

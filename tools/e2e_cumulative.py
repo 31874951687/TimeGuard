@@ -525,37 +525,38 @@ def main() -> int:
               win.notebook.index("current") == win.notebook_index_checkin,
               str(win.notebook.index("current")))
 
-        # ---- 开机自启：标题栏开关（设置页同一项）----
-        check("标题栏有「⚡ 开机自启」开关",
-              hasattr(win, "btn_autostart") and win.btn_autostart.winfo_exists() == 1
-              and "开机自启" in win.btn_autostart.cget("text"),
-              win.btn_autostart.cget("text") if hasattr(win, "btn_autostart") else "—")
+        # ---- 开机自启（v1.7.1 起只在设置页，顶栏按钮已按用户要求移除）----
+        check("顶栏不再有开机自启按钮", not hasattr(win, "btn_autostart"))
         if not autostart.is_supported():
             print("  [跳过] 本机不支持注册表自启")
         else:
             original = autostart.is_enabled()
             try:
-                win.var_autostart.set(True)
-                win.toggle_autostart()
+                check("设置页能读到当前自启状态",
+                      win.settings_panel.tree.exists("autostart_enabled"),
+                      str(original))
+
+                def set_autostart(value: bool) -> None:
+                    """走设置页真实路径：_toggle_value（立刻就写注册表）+ save。"""
+                    page = win.settings_panel
+                    setting = next(s for s in page._schema if s.key == "autostart_enabled")
+                    if bool(page._draft.get("autostart_enabled")) != value:
+                        page._toggle_value(setting)
+                    page.save()
+                    pump(0.4)
+
+                win.notebook.select(win.notebook_index_settings)
                 pump(0.3)
-                check("打开开关 → 注册表 Run 键真的写进去了",
-                      autostart.is_enabled() is True and win.var_autostart.get() is True
-                      and "：开" in win.btn_autostart.cget("text"),
-                      f"{autostart.status_text()} / 按钮={win.btn_autostart.cget('text')}")
-                check("配置文件 autostart_enabled 同步为 True",
-                      win.config.settings.autostart_enabled is True)
-                win.var_autostart.set(False)
-                win.toggle_autostart()
-                pump(0.3)
-                check("关掉开关 → 注册表项被删掉",
-                      autostart.is_enabled() is False
-                      and win.config.settings.autostart_enabled is False,
-                      autostart.status_text())
+                set_autostart(True)
+                check("设置页打开自启 → 注册表 Run 键真的写进去了",
+                      autostart.is_enabled() is True, autostart.status_text())
+                set_autostart(False)
+                check("设置页关掉自启 → 注册表项被删掉",
+                      autostart.is_enabled() is False, autostart.status_text())
             finally:
-                autostart.apply(original)      # 恢复用户原来的设置，别把自启留在测试值上
+                autostart.apply(original)
                 win.config.settings.autostart_enabled = original
                 win.config.save()
-                win.var_autostart.set(original)
             check("测试结束后已恢复原来的自启状态", autostart.is_enabled() == original,
                   autostart.status_text())
 

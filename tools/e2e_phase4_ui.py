@@ -369,7 +369,7 @@ def main() -> int:
             add(lambda dlg: (dlg.title_var.set("单次：交周报"),
                              dlg.type_var.set(label_of("once")),
                              dlg._on_type_change(),          # noqa: SLF001
-                             dlg.picker.set(datetime.now() + timedelta(hours=2))))
+                             dlg.picker.set(datetime.now() + timedelta(minutes=5))))
             add(lambda dlg: (dlg.title_var.set("单次：三天后交材料"),
                              dlg.type_var.set(label_of("once")),
                              dlg._on_type_change(),          # noqa: SLF001
