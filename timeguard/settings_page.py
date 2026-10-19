@@ -417,8 +417,12 @@ class SettingsPage(ttk.Frame):
 
             # ---- 数据与维护 ----
             Setting("__actions__", "常用操作", "数据与维护", "action",
-                    hint="测试提醒 / 清零统计 / 导出 CSV / 打开数据目录"),            Setting("__about__", "数据位置与版本", "数据与维护", "action",
+                    hint="测试提醒 / 清零统计 / 导出 CSV / 打开数据目录"),
+            Setting("__about__", "数据位置与版本", "数据与维护", "action",
                     hint=f"设置与记录保存在 %APPDATA%\\{APP_NAME}"),
+            # 通知后端（v1.7）：从标题栏搬到这里 —— 它只在"通知没弹出来"排错时才需要看
+            Setting("__notifier__", "当前通知后端", "数据与维护", "action",
+                    hint="系统通知走这个后端；换后端要改 config.json 的 notifier_backend"),
         ]
         for item in self._schema:
             item.keywords = (f"{item.label} {item.group} {item.key} {item.hint} "
@@ -587,6 +591,9 @@ class SettingsPage(ttk.Frame):
     def _display_value(self, setting: Setting) -> str:
         """「当前值」列的文字。"""
         if setting.kind == "action":
+            # "当前通知后端"这一行显示运行时的真实后端（v1.7：原来它挤在标题栏里）
+            if setting.key == "__notifier__":
+                return self._notifier_backend()
             return "点击下方按钮"
         if setting.kind == "window":
             return f"{int(self._draft.get('window_width', 0))} × {int(self._draft.get('window_height', 0))}"
@@ -682,7 +689,7 @@ class SettingsPage(ttk.Frame):
                       style="CardHint.TLabel").pack(anchor="w")
 
     def _action_buttons_for(self, key: str) -> list[tuple[str, Callable[[], None]]]:
-        """「常用操作」/「数据位置」两项的按钮。"""
+        """「常用操作」/「数据位置」/「通知后端」几项的按钮。"""
         if key == "__actions__":
             return [
                 ("🔔 测试使用时长提醒", self.app.test_reminder),
@@ -692,6 +699,14 @@ class SettingsPage(ttk.Frame):
                 ("📁 打开数据目录", self.app.open_data_dir),
                 ("☀ 待办提醒预览", self.app.show_task_reminder_again),
             ]
+        if key == "__notifier__":
+            # 纯展示项：说明当前后端，外加一个"发一条测试通知"的按钮方便排错
+            self.hint_var.set(
+                f"当前通知后端：{self._notifier_backend()}\n"
+                "如果系统通知一直不弹，先点下面的按钮发一条测试通知；\n"
+                "再不行就查日志里的「通知」记录（通知失败不会影响软件内的弹窗）。"
+            )
+            return [("🔔 发一条测试通知", self._test_notifier)]
         from . import __version__, paths
 
         self.hint_var.set(
@@ -704,6 +719,25 @@ class SettingsPage(ttk.Frame):
         return [("📂 打开数据目录", self.app.open_data_dir)]
 
     # ---- 右侧编辑器 ----
+    def _notifier_backend(self) -> str:
+        """当前通知后端（拿不到就写"未知"，不影响设置页打开）。"""
+        try:
+            notifier = getattr(self.app, "notifier", None)
+            return str(getattr(notifier, "backend", None) or "未知")
+        except Exception:  # noqa: BLE001
+            return "未知"
+
+    def _test_notifier(self) -> None:
+        """发一条测试通知（排错用；失败只提示，不抛）。"""
+        try:
+            self.app.notifier.notify("TimeGuard 测试通知",
+                                     "如果你看到这条通知，说明系统通知这条链路是通的。",
+                                     timeout=8)
+            self.hint_var.set("已发出测试通知 —— 没看到的话检查 Windows 通知设置"
+                              "（专注助手 / 通知权限）或日志里的失败原因。")
+        except Exception as exc:  # noqa: BLE001
+            self.hint_var.set(f"发送失败：{exc}")
+
     def _build_detail_editor(self, setting: Setting) -> None:
         """为需要多个控件的设置构建右侧编辑器。"""
         if setting.kind in ("int", "float"):

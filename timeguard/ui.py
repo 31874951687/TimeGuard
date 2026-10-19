@@ -1,4 +1,4 @@
-﻿"""主界面：深色主题的 tkinter 窗口（实时状态 / 统计图表 / 设置面板）+ 系统托盘。
+"""主界面：深色主题的 tkinter 窗口（实时状态 / 统计图表 / 设置面板）+ 系统托盘。
 
 界面结构::
 
@@ -29,6 +29,7 @@ from . import notifier as notifier_mod
 from . import autostart, paths, phrases, winapi
 from .chart import WeekChart, pick_cjk_font
 from .checkin_page import CheckinPage
+from .donut import DonutPanel
 from .config import Config
 from .database import UsageStore
 from .engine import Snapshot, UsageEngine
@@ -36,6 +37,7 @@ from .notifier import Notifier, PopupManager
 from .recurrence import auto_checkin_ready
 from .scheduler import TaskScheduler
 from .settings_page import SettingsPage
+from .today_detail import TodayDetail
 from .tasks import (
     RecurringReminderDialog,
     StartupCheckDialog,
@@ -524,6 +526,17 @@ class MainWindow:
         self.label_remain = ttk.Label(mid_box, text="2小时", style="StatValue.TLabel")
         self.label_remain.pack(anchor="w")
 
+        # 计时口径胶囊（v1.7）：合并计时 / 分别计时**就在计时旁边**，点一下即切换。
+        # 它描述的是"这些时长怎么算"，所以归属计时区，不该待在顶栏。
+        self.btn_count_mode = tk.Label(
+            used_row, text="合并计时", bg=PANEL_ALT, fg=FG, font=self.font_small,
+            padx=8, pady=1, cursor="hand2")
+        self.btn_count_mode.pack(side="left", padx=(10, 0), pady=(6, 0))
+        self.btn_count_mode.bind("<Button-1>", lambda _e: self.toggle_count_mode())
+        self.btn_count_mode.bind("<Enter>", lambda _e: self.btn_count_mode.configure(bg=ACCENT, fg="#ffffff"))
+        self.btn_count_mode.bind("<Leave>", lambda _e: self._style_mode_pill())
+        self._style_mode_pill()          # 按配置里的真实模式初始化（别写死"合并计时"）
+
         right_box = ttk.Frame(top, style="Card.TFrame")
         right_box.grid(row=0, column=2, sticky="e")
         ttk.Label(right_box, text="下次提醒 / 今日提醒次数", style="Stat.TLabel").pack(anchor="e")
@@ -547,6 +560,11 @@ class MainWindow:
         self.label_foreground = ttk.Label(status_row, text="", style="CardHint.TLabel")
         self.label_foreground.grid(row=0, column=1, sticky="e", padx=(16, 0))
 
+        # 「今日各对象明细」折叠条（v1.7）：从统计页搬进计时卡片，默认收起
+        self.today_detail = TodayDetail(card, font_family=self.font_family,
+                                        on_toggle=self._on_detail_toggle)
+        self.today_detail.grid(row=3, column=0, sticky="ew", pady=(2, 0))
+
         # ---------- 选项卡 ----------
         notebook = ttk.Notebook(outer)
         notebook.grid(row=2, column=0, sticky="nsew")
@@ -566,17 +584,11 @@ class MainWindow:
         self.chart.pack(fill="both", expand=True)
         stats_paned.add(chart_holder, weight=4)
 
+        # 下半屏：今日对象占比环图（v1.7）。原来的"今日各对象明细"表格搬到了
+        # 计时卡片的折叠条里 —— 明细属于"今天计时花在谁身上"，趋势才是统计该讲的。
         summary = ttk.Frame(stats_paned, style="Card.TFrame")
-        ttk.Label(summary, text="📊 今日各对象明细", style="CardTitle.TLabel").pack(anchor="w", pady=(6, 4))
-        self.tree = ttk.Treeview(summary, columns=("target", "kind", "time"), show="headings", height=6)
-        self.tree.heading("target", text="监控对象")
-        self.tree.heading("kind", text="类型")
-        self.tree.heading("time", text="今日时长")
-        self.tree.column("target", width=340, anchor="w")
-        self.tree.column("kind", width=120, anchor="center")
-        self.tree.column("time", width=160, anchor="e")
-        self._style_tree()
-        self.tree.pack(fill="both", expand=True)
+        self.donut_panel = DonutPanel(summary, font_family=self.font_family)
+        self.donut_panel.pack(fill="both", expand=True)
         stats_paned.add(summary, weight=5)
         self.stats_paned = stats_paned
         self._stats_sash_pending = True
@@ -623,6 +635,8 @@ class MainWindow:
         self.settings_scroll = self.settings_panel
         notebook.add(settings_page, text="⚙ 设置")
         self.notebook_index_settings = 3
+        # 切到统计页/任何页时把对应视图补一次（环图只在可见时画，省 CPU）
+        notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed, add="+")
 
         # ---------- 底部提示条 ----------
         self.label_toast = tk.Label(
@@ -777,13 +791,15 @@ class MainWindow:
         snapshot = self.snapshot
         if snapshot is None:
             return
-        settings = self.config.settings
 
         self.label_used.configure(
             text=fmt_duration(snapshot.total_seconds, with_seconds=False),
             style="BigOver.TLabel" if snapshot.over_limit else "Big.TLabel",
         )
-        self.label_limit.configure(text=f" / {fmt_duration(snapshot.limit_seconds, with_seconds=False)}")
+        # 上限为 0 表示"不设限制"，别再显示成「/ 0秒」那样让人以为坏了
+        self.label_limit.configure(
+            text=(" / 不限" if snapshot.limit_seconds <= 0
+                  else f" / {fmt_duration(snapshot.limit_seconds, with_seconds=False)}"))
         remaining = snapshot.limit_seconds - snapshot.total_seconds
         self.label_remain.configure(
             text=("已超出 " + fmt_duration(-remaining, with_seconds=False)) if remaining < 0
@@ -819,36 +835,96 @@ class MainWindow:
         if snapshot.fullscreen:
             fg_text += "　|　全屏中"
         self.label_foreground.configure(text=fg_text)
-        # 顶部状态栏
-        mode_cn = "合并计时" if settings.count_mode == "total" else "分别计时"
+        # 顶部状态栏只留**实时状态**（v1.7，用户要求）：
+        # 上限 / 提醒间隔 / 计时模式 / 通知后端 都是配置或诊断信息，
+        # 顶栏常驻展示既重复（设置页、计时卡片里都有）又占地方。
         self.label_status.configure(
-            text=f"{'● 监控中' if snapshot.monitoring else '○ 已暂停'}　·　"
-                 f"上限 {settings.daily_limit_minutes} 分钟　·　提醒间隔 {settings.reminder_interval_minutes} 分钟"
-                 f"　·　{mode_cn}　·　通知后端 {self.notifier.backend}"
+            text="● 监控中" if snapshot.monitoring else "○ 已暂停",
+            foreground=GREEN if snapshot.monitoring else AMBER,
         )
         self.btn_pause.configure(text="▶ 继续计时" if self.engine.paused else "⏸ 暂停计时")
 
-    def _refresh_tree(self) -> None:
-        """刷新“今日各对象明细”表格（仅在统计页可见时执行，省 CPU）。"""
+    def _on_tab_changed(self, _event=None) -> None:
+        """切换标签页后补齐该页的数据（环图/图表都只在可见时算）。"""
         try:
-            if self.notebook.index("current") != 0:
-                return
+            if self.notebook.index("current") == 0:
+                self.donut_panel.refresh(self.store.today_targets())
+        except Exception:  # noqa: BLE001
+            log.debug("切换标签页后刷新环图失败", exc_info=True)
+
+    # ------------------------------------------------------------------ 计时口径 / 明细
+    def _style_mode_pill(self) -> None:
+        """主题色复位（鼠标移开时调用；也用于初始化）。"""
+        try:
+            mode = getattr(self.config.settings, "count_mode", "total")
+            self.btn_count_mode.configure(
+                text="合并计时" if mode == "total" else "分别计时",
+                bg=PANEL_ALT, fg=FG)
         except tk.TclError:
+            log.debug("更新计时口径胶囊失败", exc_info=True)
+
+    def toggle_count_mode(self) -> None:
+        """点胶囊切换 合并计时 ⇄ 分别计时（写配置 + 立即生效，与设置页同一份数据）。"""
+        settings = self.config.settings
+        new_mode = "each" if getattr(settings, "count_mode", "total") == "total" else "total"
+        settings.count_mode = new_mode
+        try:
+            self.config.save()
+        except Exception:  # noqa: BLE001
+            log.debug("保存计时口径失败", exc_info=True)
+        try:
+            self.engine.update_settings(count_mode=new_mode)
+        except Exception:  # noqa: BLE001
+            log.exception("切换计时口径失败")
+        self._style_mode_pill()
+        try:
+            self.settings_panel.refresh()
+        except Exception:  # noqa: BLE001
+            log.debug("同步设置页的计时口径失败", exc_info=True)
+        label = "合并计时（所有对象算一个总和）" if new_mode == "total" \
+            else "分别计时（每个对象单独算上限）"
+        log.info("计时口径切换为 %s", new_mode)
+        self.show_toast_message(f"已切换为{label}")
+
+    def _on_detail_toggle(self, expanded: bool) -> None:
+        """展开/收起今日明细后立刻把统计补上（收起时不用管）。"""
+        if not expanded:
             return
-        stats = self.store.today_targets()
-        existing = self.tree.get_children()
+        try:
+            self.today_detail.refresh(self.store.today_targets())
+        except Exception:  # noqa: BLE001
+            log.debug("展开今日明细时刷新失败", exc_info=True)
+
+    def _refresh_tree(self) -> None:
+        """刷新计时卡片里的「今日各对象明细」折叠条 + 统计页的对象占比环图。
+
+        名字保留 ``_refresh_tree`` 是为了让既有的定时器/回调不用改；
+        内容从"填 Treeview"变成了"喂两个自绘控件"（v1.7）。
+
+        只有**对应控件真的可见**时才干活：
+        * 折叠条：展开时才需要重画行（收起只更新标题里的合计）；
+        * 环图：只在统计页可见时重画，省 CPU。
+        """
+        try:
+            stats = self.store.today_targets()
+        except Exception:  # noqa: BLE001 - 读库失败不该打断刷新
+            log.debug("读取今日各对象统计失败", exc_info=True)
+            return
         signature = tuple((s.name, round(s.seconds, 1)) for s in stats)
-        if getattr(self, "_tree_signature", None) == signature:
+        changed = getattr(self, "_tree_signature", None) != signature
+        # 折叠条：标题行要实时更新（合计时长），展开时还要重画明细行
+        try:
+            self.today_detail.refresh(stats if changed else None)
+        except tk.TclError:
+            log.debug("刷新今日明细折叠条失败", exc_info=True)
+        if not changed:
             return
         self._tree_signature = signature
-        for item in existing:
-            self.tree.delete(item)
-        for stat in stats:
-            self.tree.insert(
-                "", "end",
-                values=(stat.name, "游戏/软件" if stat.kind == "game" else "网页",
-                        fmt_duration(stat.seconds, with_seconds=False)),
-            )
+        try:
+            if self.notebook.index("current") == 0:
+                self.donut_panel.refresh(stats)
+        except tk.TclError:
+            return
 
     def refresh_chart(self) -> None:
         """重绘 7 天柱状图（时长图表 + 任务完成情况图表）。"""

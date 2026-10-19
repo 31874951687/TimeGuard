@@ -458,7 +458,8 @@ def main() -> int:
         group_rows = [i for i in page.tree.get_children() if i.startswith("__grp__")]
         print("控件自检:", all([
             window.bar.winfo_exists(), window.chart.winfo_exists(),
-            window.tree.winfo_exists(),
+            # v1.7：统计页的明细表换成了对象占比环图，明细搬到计时卡片的折叠条
+            window.donut_panel.donut.winfo_exists(), window.today_detail.winfo_exists(),
             page.tree.winfo_exists(),
             len(setting_rows) >= 15,
             page.tree.cget("columns") == ("group", "name", "value", "desc"),
